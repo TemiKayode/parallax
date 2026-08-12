@@ -6,6 +6,8 @@ A cross-venue, multi-asset, event-driven statistical arbitrageur for prediction 
 
 This repo is the reference implementation of that design. It's a working skeleton with real, tested logic in every layer — not a mockup: **61 Rust tests and 15 Python tests pass**, clippy is clean with zero warnings, and the web dashboard pulls **real, live quotes** from Kalshi's and Polymarket's public market-data APIs alongside a CLI/dashboard demo that runs a full tick-to-fill scenario against the real engine. What it is *not* yet is a live trading system: order *submission* to Kalshi and Polymarket is deliberately incomplete (see [Status](#status)) until request signing and the live payload shape are verified against each venue's current order-entry API — see [Production readiness](#production-readiness) for exactly what that gap means. Live **data** and live **trading** are different claims; this repo makes the first one honestly and does not make the second one at all.
 
+![The PARALLAX dashboard showing live Kalshi and Polymarket quotes, the arbitrage detector, and the backtest runner](docs/dashboard.png)
+
 ## Layout
 
 ```
