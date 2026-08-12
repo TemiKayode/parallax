@@ -64,7 +64,10 @@ impl KalshiAdapter {
     /// demo/sandbox environment during testing.
     pub fn new(signer: Arc<dyn KalshiRequestSigner>) -> Self {
         KalshiAdapter {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             base_url: "https://external-api.kalshi.com/trade-api/v2".to_string(),
             signer,
         }
@@ -73,6 +76,36 @@ impl KalshiAdapter {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    /// `GET /markets?series_ticker=...&status=open` — public,
+    /// unauthenticated. Lets a caller discover a live, currently-open
+    /// market for a series (e.g. `KXHIGHCHI`, Kalshi's real "highest
+    /// temperature in Chicago" series) instead of hardcoding a specific
+    /// dated ticker that would go stale the moment that market closes.
+    pub async fn fetch_open_markets_for_series_raw(
+        &self,
+        series_ticker: &str,
+        limit: u32,
+    ) -> Result<Value, ExecError> {
+        let url = format!("{}/markets", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("series_ticker", series_ticker), ("status", "open")])
+            .query(&[("limit", limit)])
+            .send()
+            .await
+            .map_err(|e| ExecError::Connection {
+                venue: VenueId::Kalshi,
+                message: e.to_string(),
+            })?;
+        resp.json::<Value>()
+            .await
+            .map_err(|e| ExecError::Connection {
+                venue: VenueId::Kalshi,
+                message: e.to_string(),
+            })
     }
 
     /// `GET /markets/{ticker}/orderbook` — public, unauthenticated.

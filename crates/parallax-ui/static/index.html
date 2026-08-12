@@ -11,20 +11,43 @@
   <header class="hero">
     <div class="hero-row">
       <div>
-        <span class="eyebrow">Local dashboard · synthetic data only</span>
+        <span class="eyebrow">Local dashboard · live market data</span>
         <h1>PARALLAX<span class="mark">.</span></h1>
         <p class="dek">Cross-venue, event-driven statistical arbitrage for prediction markets — this page talks directly to the real Rust engine over a local API, not a mock.</p>
       </div>
       <button id="theme-toggle" type="button" aria-label="Toggle light/dark theme">◐</button>
     </div>
     <div class="tag-row">
-      <span class="tag">Polymarket</span>
-      <span class="tag">Kalshi</span>
-      <span class="tag safe">no live orders — PaperAdapter only</span>
+      <span class="tag safe">live quotes — real API calls</span>
+      <span class="tag safe">no live orders — signer unconfigured</span>
     </div>
   </header>
 
   <main>
+    <section class="panel span-2" aria-labelledby="live-heading">
+      <div class="panel-head">
+        <div class="panel-head-row">
+          <h2 id="live-heading">Live venue quotes</h2>
+          <button id="refresh-live" type="button" class="ghost-btn">⟳ Refresh both</button>
+        </div>
+        <p class="panel-sub">Real HTTP calls to each venue's public market-data endpoint, made just now — not cached, not mocked, and read-only: nothing on this page can place an order.</p>
+      </div>
+      <div class="live-grid">
+        <div class="live-card venue-k" id="live-kalshi" data-venue="kalshi">
+          <div class="live-card-head">
+            <span class="venue-name">Kalshi</span>
+          </div>
+          <p class="hint">Loading live quote…</p>
+        </div>
+        <div class="live-card venue-a" id="live-polymarket" data-venue="polymarket">
+          <div class="live-card-head">
+            <span class="venue-name">Polymarket</span>
+          </div>
+          <p class="hint">Loading live quote…</p>
+        </div>
+      </div>
+    </section>
+
     <section class="panel" aria-labelledby="arb-heading">
       <div class="panel-head">
         <h2 id="arb-heading">Cross-venue arbitrage detector</h2>
@@ -71,7 +94,7 @@
   </main>
 
   <footer>
-    <p>Runs entirely against synthetic data via the in-memory <code>PaperAdapter</code>. No live venue connection, no credentials, no order sent anywhere. Full design: see the repository README.</p>
+    <p><strong>Live venue quotes</strong> above are real, read-only HTTP calls to Kalshi's and Polymarket's public market-data endpoints. <strong>Arb detector and backtest</strong> panels run against synthetic data via the in-memory <code>PaperAdapter</code>. Neither path can place a real order — that stays gated behind an unconfigured request signer regardless of which panel you're using. No credentials involved anywhere on this page. Full design: see the repository README.</p>
   </footer>
 
   <script src="/app.js" defer></script>

@@ -45,19 +45,24 @@ impl PolymarketOrderSigner for UnconfiguredPolymarketSigner {
 pub struct PolymarketAdapter {
     http: reqwest::Client,
     clob_base_url: String,
+    gamma_base_url: String,
     signer: Arc<dyn PolymarketOrderSigner>,
 }
 
 impl PolymarketAdapter {
-    /// `clob_base_url` defaults to `https://clob.polymarket.com`, the
-    /// production CLOB API host documented at docs.polymarket.com as of
-    /// 2026-08. The Gamma API (`https://gamma-api.polymarket.com`) is a
-    /// separate host used for market/event discovery, not order
-    /// management, and isn't wired in here.
+    /// `clob_base_url` defaults to `https://clob.polymarket.com` (order
+    /// book state and order management) and `gamma_base_url` to
+    /// `https://gamma-api.polymarket.com` (event/market discovery) — the
+    /// two production hosts documented at docs.polymarket.com as of
+    /// 2026-08.
     pub fn new(signer: Arc<dyn PolymarketOrderSigner>) -> Self {
         PolymarketAdapter {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
             clob_base_url: "https://clob.polymarket.com".to_string(),
+            gamma_base_url: "https://gamma-api.polymarket.com".to_string(),
             signer,
         }
     }
@@ -65,6 +70,41 @@ impl PolymarketAdapter {
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.clob_base_url = base_url.into();
         self
+    }
+
+    pub fn with_gamma_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.gamma_base_url = base_url.into();
+        self
+    }
+
+    /// `GET /markets?active=true&closed=false&order=volume24hr` on the
+    /// Gamma API — public, unauthenticated market discovery. Each
+    /// returned market's `clobTokenIds` field is what `fetch_book_raw`
+    /// needs to look up that market's live order book on the CLOB.
+    pub async fn fetch_active_markets_raw(&self, limit: u32) -> Result<Value, ExecError> {
+        let url = format!("{}/markets", self.gamma_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[
+                ("active", "true"),
+                ("closed", "false"),
+                ("order", "volume24hr"),
+                ("ascending", "false"),
+            ])
+            .query(&[("limit", limit)])
+            .send()
+            .await
+            .map_err(|e| ExecError::Connection {
+                venue: VenueId::Polymarket,
+                message: e.to_string(),
+            })?;
+        resp.json::<Value>()
+            .await
+            .map_err(|e| ExecError::Connection {
+                venue: VenueId::Polymarket,
+                message: e.to_string(),
+            })
     }
 
     /// `GET /book?token_id=...` — public, unauthenticated.

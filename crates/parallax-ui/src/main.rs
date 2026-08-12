@@ -1,17 +1,21 @@
-//! A local web dashboard for PARALLAX. Runs entirely against synthetic
-//! data through the in-memory `PaperAdapter` — no live venue connection,
-//! no credentials, nothing here can place a real order. It exists so the
-//! engine in `crates/` is something you can look at in a browser instead
-//! of only reading test output.
+//! A local web dashboard for PARALLAX. Two kinds of data live here, and
+//! the UI is explicit about which is which: the backtest/arb-detector
+//! panels run against synthetic data through the in-memory `PaperAdapter`,
+//! while the "Live venue quotes" panel makes real HTTP calls to Kalshi's
+//! and Polymarket's public market-data endpoints (see `live.rs`) and
+//! shows exactly what those venues are quoting right now. Neither path
+//! can place a real order — that stays gated behind an unconfigured
+//! signer regardless of which panel you're looking at.
 //!
 //! Run with `cargo run -p parallax-ui` (or the installed `parallax-ui`
 //! binary — see the repo README for "run from anywhere" instructions),
 //! then open http://127.0.0.1:7878.
 
 mod dto;
+mod live;
 
 use axum::extract::Json;
-use axum::http::header;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Router;
@@ -66,6 +70,20 @@ async fn backtest_handler() -> Json<BacktestResponse> {
     Json(BacktestResponse::from(report))
 }
 
+async fn live_kalshi_handler() -> Result<Json<live::LiveQuote>, (StatusCode, String)> {
+    live::fetch_live_kalshi()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+}
+
+async fn live_polymarket_handler() -> Result<Json<live::LiveQuote>, (StatusCode, String)> {
+    live::fetch_live_polymarket()
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+}
+
 #[tokio::main]
 async fn main() {
     let app = Router::new()
@@ -73,13 +91,17 @@ async fn main() {
         .route("/style.css", get(style_css))
         .route("/app.js", get(app_js))
         .route("/api/arb", post(arb_handler))
-        .route("/api/backtest", post(backtest_handler));
+        .route("/api/backtest", post(backtest_handler))
+        .route("/api/live/kalshi", get(live_kalshi_handler))
+        .route("/api/live/polymarket", get(live_polymarket_handler));
 
     let addr = "127.0.0.1:7878";
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind to 127.0.0.1:7878");
     println!("PARALLAX dashboard running at http://{addr}");
-    println!("Synthetic data only — no live venue connection, no credentials, no real orders.");
+    println!("Live venue quotes: real read-only API calls to Kalshi and Polymarket.");
+    println!("Backtest/arb-detector panels: synthetic data via the in-memory PaperAdapter.");
+    println!("No live order submission anywhere — that stays gated behind an unconfigured signer.");
     axum::serve(listener, app).await.expect("server error");
 }

@@ -11,6 +11,63 @@
 
   const fmt = (n, digits = 2) => Number(n).toFixed(digits);
 
+  const liveCards = {
+    kalshi: document.getElementById("live-kalshi"),
+    polymarket: document.getElementById("live-polymarket"),
+  };
+
+  async function loadLiveQuote(venue) {
+    const card = liveCards[venue];
+    const nameLabel = card.dataset.venue === "kalshi" ? "Kalshi" : "Polymarket";
+    card.innerHTML = `<div class="live-card-head"><span class="venue-name">${nameLabel}</span></div><p class="hint">Fetching live quote…</p>`;
+    try {
+      const res = await fetch(`/api/live/${venue}`);
+      const body = await res.json();
+      if (!res.ok) {
+        const message = typeof body === "string" ? body : JSON.stringify(body);
+        throw new Error(message);
+      }
+      renderLiveQuote(card, nameLabel, body);
+    } catch (err) {
+      card.innerHTML = `
+        <div class="live-card-head"><span class="venue-name">${nameLabel}</span></div>
+        <p class="live-error">Live fetch failed: ${escapeHtml(String(err.message || err))}</p>
+      `;
+    }
+  }
+
+  function renderLiveQuote(card, nameLabel, q) {
+    const fetchedAt = new Date().toLocaleTimeString();
+    card.innerHTML = `
+      <div class="live-card-head">
+        <span class="venue-name">${nameLabel}</span>
+        <span class="live-fetched">fetched ${fetchedAt}</span>
+      </div>
+      <p class="live-label">${escapeHtml(q.label)}</p>
+      <div class="live-quote-row">
+        <div class="q">
+          <span class="q-label">Bid</span>
+          <span class="q-value">${fmt(q.bid)}</span>
+          <span class="q-size">size ${fmt(q.bid_size)}</span>
+        </div>
+        <div class="q">
+          <span class="q-label">Ask</span>
+          <span class="q-value">${fmt(q.ask)}</span>
+          <span class="q-size">size ${fmt(q.ask_size)}</span>
+        </div>
+      </div>
+      <p class="live-detail">${escapeHtml(q.detail)}</p>
+    `;
+  }
+
+  function loadAllLiveQuotes() {
+    loadLiveQuote("kalshi");
+    loadLiveQuote("polymarket");
+  }
+
+  document.getElementById("refresh-live").addEventListener("click", loadAllLiveQuotes);
+  loadAllLiveQuotes();
+
   const arbForm = document.getElementById("arb-form");
   const arbResult = document.getElementById("arb-result");
 

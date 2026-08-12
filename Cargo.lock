@@ -619,7 +619,9 @@ dependencies = [
  "parallax-book",
  "parallax-cli",
  "parallax-sim",
+ "parallax-venues",
  "serde",
+ "serde_json",
  "tokio",
 ]
 

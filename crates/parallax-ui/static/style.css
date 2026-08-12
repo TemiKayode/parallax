@@ -109,9 +109,50 @@ main {
   border-radius: 10px;
   padding: 1.4rem 1.5rem 1.6rem;
 }
+@media (min-width: 900px) {
+  .panel.span-2 { grid-column: 1 / -1; }
+}
 .panel-head { margin-bottom: 1rem; }
+.panel-head-row { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }
 .panel h2 { font-size: 1.05rem; }
 .panel-sub { color: var(--ink-soft); font-size: 0.82rem; margin: 0.5rem 0 0; max-width: 52ch; }
+
+.ghost-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ink-soft);
+  border-radius: 8px;
+  padding: 0.4rem 0.8rem;
+  font-family: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.ghost-btn:hover { border-color: var(--signal); color: var(--ink); }
+
+.live-grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+@media (min-width: 640px) {
+  .live-grid { grid-template-columns: 1fr 1fr; }
+}
+.live-card {
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--venue-k);
+  border-radius: 8px;
+  padding: 0.9rem 1rem 1rem;
+  min-height: 7rem;
+}
+.live-card.venue-a { border-left-color: var(--venue-a); }
+.live-card-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 0.5rem; }
+.venue-name { font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-soft); }
+.live-fetched { font-size: 0.68rem; color: var(--ink-soft); }
+.live-label { font-size: 0.9rem; margin: 0 0 0.6rem; line-height: 1.4; }
+.live-quote-row { display: flex; gap: 1.4rem; margin-bottom: 0.4rem; }
+.live-quote-row .q { display: flex; flex-direction: column; }
+.live-quote-row .q-label { font-size: 0.66rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-soft); }
+.live-quote-row .q-value { font-size: 1.1rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.live-quote-row .q-size { font-size: 0.7rem; color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+.live-detail { font-size: 0.7rem; color: var(--ink-soft); word-break: break-word; }
+.live-error { color: var(--bad); font-size: 0.82rem; margin: 0; }
 
 .quote-form { display: flex; flex-direction: column; gap: 0.9rem; margin-bottom: 1rem; }
 .venue-fields {
