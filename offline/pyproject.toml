@@ -1,0 +1,14 @@
+[project]
+name = "parallax-research"
+version = "0.1.0"
+description = "Offline research and calibration tooling for PARALLAX's alpha models (design doc §12) — validates the constants baked into crates/parallax-alpha before they ship, and exports fitted parameters as a config artifact the Rust hot path loads."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

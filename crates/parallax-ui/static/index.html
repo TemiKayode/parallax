@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PARALLAX — dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><text y=%2224%22 font-size=%2226%22>📡</text></svg>" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-row">
+      <div>
+        <span class="eyebrow">Local dashboard · synthetic data only</span>
+        <h1>PARALLAX<span class="mark">.</span></h1>
+        <p class="dek">Cross-venue, event-driven statistical arbitrage for prediction markets — this page talks directly to the real Rust engine over a local API, not a mock.</p>
+      </div>
+      <button id="theme-toggle" type="button" aria-label="Toggle light/dark theme">◐</button>
+    </div>
+    <div class="tag-row">
+      <span class="tag">Polymarket</span>
+      <span class="tag">Kalshi</span>
+      <span class="tag safe">no live orders — PaperAdapter only</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" aria-labelledby="arb-heading">
+      <div class="panel-head">
+        <h2 id="arb-heading">Cross-venue arbitrage detector</h2>
+        <p class="panel-sub">Same canonical contract, two venues. No model — just <code>parallax-book::detect_arb</code> checking whether one venue's ask undercuts the other's bid.</p>
+      </div>
+
+      <form id="arb-form" class="quote-form">
+        <fieldset class="venue-fields venue-a">
+          <legend>Polymarket</legend>
+          <label>Bid <input type="number" step="0.01" min="0" max="1" name="polymarket_bid" value="0.55" required /></label>
+          <label>Ask <input type="number" step="0.01" min="0" max="1" name="polymarket_ask" value="0.60" required /></label>
+        </fieldset>
+        <fieldset class="venue-fields venue-k">
+          <legend>Kalshi</legend>
+          <label>Bid <input type="number" step="0.01" min="0" max="1" name="kalshi_bid" value="0.66" required /></label>
+          <label>Ask <input type="number" step="0.01" min="0" max="1" name="kalshi_ask" value="0.70" required /></label>
+        </fieldset>
+        <button type="submit">Check for arbitrage</button>
+      </form>
+
+      <div id="arb-result" class="result-box" aria-live="polite">
+        <p class="hint">Fill in both venues' quotes and check — try the prefilled numbers first.</p>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="backtest-heading">
+      <div class="panel-head">
+        <h2 id="backtest-heading">Backtest: weather update → stale quote → fill</h2>
+        <p class="panel-sub">Runs the full pipeline — alpha aggregation, all three strategy engines, the risk gate, and the in-memory matching engine — against a fixed synthetic scenario, live, on every click.</p>
+      </div>
+
+      <ol class="scenario">
+        <li><strong>t=0</strong> HRRR ensemble: 5/5 members forecast &gt;86.9°F for Chicago on 2026-08-12</li>
+        <li><strong>t=1ms</strong> Polymarket still quoting bid 0.50 / ask 0.55 (stale, pre-update)</li>
+        <li><strong>t=2ms</strong> Kalshi quoting bid 0.90 / ask 0.94 (already repriced)</li>
+      </ol>
+
+      <button id="run-backtest" type="button">Run scenario</button>
+
+      <div id="backtest-result" class="result-box" aria-live="polite">
+        <p class="hint">Click "Run scenario" to execute it against the real engine.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Runs entirely against synthetic data via the in-memory <code>PaperAdapter</code>. No live venue connection, no credentials, no order sent anywhere. Full design: see the repository README.</p>
+  </footer>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

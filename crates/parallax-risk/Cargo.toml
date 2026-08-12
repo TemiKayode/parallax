@@ -1,0 +1,9 @@
+[package]
+name = "parallax-risk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parallax-types.workspace = true
+parallax-book.workspace = true

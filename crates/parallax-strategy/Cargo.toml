@@ -1,0 +1,10 @@
+[package]
+name = "parallax-strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parallax-types.workspace = true
+parallax-book.workspace = true
+parallax-risk.workspace = true

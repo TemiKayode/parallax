@@ -1,0 +1,11 @@
+[package]
+name = "parallax-bus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parallax-types.workspace = true
+crossbeam-queue.workspace = true
+
+[dev-dependencies]

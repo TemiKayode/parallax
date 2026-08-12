@@ -1,0 +1,22 @@
+/target
+**/target
+
+# Python
+offline/.venv/
+offline/__pycache__/
+**/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local secrets / credentials — never commit venue API keys
+.env
+*.env
+secrets.toml
+**/credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local sandbox snapshot artifacts — not part of the source tree
+_parallax_src.tgz
