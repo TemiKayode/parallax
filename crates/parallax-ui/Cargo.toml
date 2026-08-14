@@ -15,5 +15,6 @@ parallax-sim.workspace = true
 parallax-venues.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "signal"] }
 axum = "0.7"
+tower = { version = "0.4", features = ["limit"] }

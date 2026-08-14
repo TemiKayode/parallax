@@ -10,14 +10,19 @@ mod market;
 mod orders;
 mod position;
 mod time;
+mod validate;
 mod venue;
 
-pub use alpha::{AlphaEventKind, FairValue, ProbabilityEstimate, RawEvent};
+pub use alpha::{
+    AlphaEventKind, EstimateKind, FairValue, ProbabilityEstimate, RawEvent, StalenessPolicy,
+};
 pub use contract::{CanonicalContractId, CanonicalContractSpec, ClusterKey, Direction, EventClass};
-pub use market::NormalizedTick;
+pub use market::{BookDepth, DepthLevel, NormalizedTick, WalkResult};
 pub use orders::{
-    AckStatus, EngineId, ExecError, OrderAck, OrderId, OrderIntent, OrderType, Outcome, Side,
+    AckStatus, ClientOrderId, EngineId, ExecError, OrderAck, OrderId, OrderIntent, OrderType,
+    Outcome, Side,
 };
 pub use position::Position;
 pub use time::Timestamp;
-pub use venue::{SettlementModel, VenueCapabilities, VenueId};
+pub use validate::{finite, non_negative, positive, probability, ValidationError};
+pub use venue::{FeeModel, SettlementModel, VenueCapabilities, VenueId};

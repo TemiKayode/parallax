@@ -1,7 +1,11 @@
 use crate::adapter::VenueAdapter;
+use crate::http::{client, json_or_error, RateLimiter};
+use crate::rounding::{round_lot, round_price};
+use crate::symbol_registry::SymbolRegistry;
 use async_trait::async_trait;
 use parallax_types::{
-    ExecError, OrderAck, OrderId, OrderIntent, SettlementModel, VenueCapabilities, VenueId,
+    ClientOrderId, ExecError, OrderAck, OrderId, OrderIntent, OrderType, SettlementModel,
+    VenueCapabilities, VenueId,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -47,6 +51,8 @@ pub struct PolymarketAdapter {
     clob_base_url: String,
     gamma_base_url: String,
     signer: Arc<dyn PolymarketOrderSigner>,
+    symbols: Arc<SymbolRegistry>,
+    rate_limiter: RateLimiter,
 }
 
 impl PolymarketAdapter {
@@ -54,16 +60,18 @@ impl PolymarketAdapter {
     /// book state and order management) and `gamma_base_url` to
     /// `https://gamma-api.polymarket.com` (event/market discovery) — the
     /// two production hosts documented at docs.polymarket.com as of
-    /// 2026-08.
-    pub fn new(signer: Arc<dyn PolymarketOrderSigner>) -> Self {
+    /// 2026-08. `symbols` is shared with whatever subscribes to
+    /// Polymarket's listings (design doc review 1.6): each outcome trades
+    /// as its own token, so the mapping is keyed on (contract, outcome),
+    /// not contract alone.
+    pub fn new(signer: Arc<dyn PolymarketOrderSigner>, symbols: Arc<SymbolRegistry>) -> Self {
         PolymarketAdapter {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("failed to build HTTP client"),
+            http: client(),
             clob_base_url: "https://clob.polymarket.com".to_string(),
             gamma_base_url: "https://gamma-api.polymarket.com".to_string(),
             signer,
+            symbols,
+            rate_limiter: RateLimiter::new(8),
         }
     }
 
@@ -77,11 +85,16 @@ impl PolymarketAdapter {
         self
     }
 
+    pub fn symbols(&self) -> &SymbolRegistry {
+        &self.symbols
+    }
+
     /// `GET /markets?active=true&closed=false&order=volume24hr` on the
     /// Gamma API — public, unauthenticated market discovery. Each
     /// returned market's `clobTokenIds` field is what `fetch_book_raw`
     /// needs to look up that market's live order book on the CLOB.
     pub async fn fetch_active_markets_raw(&self, limit: u32) -> Result<Value, ExecError> {
+        self.rate_limiter.acquire().await;
         let url = format!("{}/markets", self.gamma_base_url);
         let resp = self
             .http
@@ -99,16 +112,12 @@ impl PolymarketAdapter {
                 venue: VenueId::Polymarket,
                 message: e.to_string(),
             })?;
-        resp.json::<Value>()
-            .await
-            .map_err(|e| ExecError::Connection {
-                venue: VenueId::Polymarket,
-                message: e.to_string(),
-            })
+        json_or_error(resp, VenueId::Polymarket).await
     }
 
     /// `GET /book?token_id=...` — public, unauthenticated.
     pub async fn fetch_book_raw(&self, token_id: &str) -> Result<Value, ExecError> {
+        self.rate_limiter.acquire().await;
         let url = format!("{}/book", self.clob_base_url);
         let resp = self
             .http
@@ -120,12 +129,7 @@ impl PolymarketAdapter {
                 venue: VenueId::Polymarket,
                 message: e.to_string(),
             })?;
-        resp.json::<Value>()
-            .await
-            .map_err(|e| ExecError::Connection {
-                venue: VenueId::Polymarket,
-                message: e.to_string(),
-            })
+        json_or_error(resp, VenueId::Polymarket).await
     }
 }
 
@@ -193,8 +197,7 @@ impl VenueAdapter for PolymarketAdapter {
             // until that's read per-market at subscribe time.
             min_tick: 0.01,
             min_order_size: 5.0,
-            maker_fee_bps: 0.0,
-            taker_fee_bps: 0.0,
+            fee_model: parallax_types::FeeModel::polymarket_default(),
             rate_limit_per_sec: 10,
         }
     }
@@ -206,11 +209,50 @@ impl VenueAdapter for PolymarketAdapter {
     /// via `PolymarketOrderSigner` — neither should be guessed at when
     /// the target is a venue that moves real funds.
     async fn submit(&self, order: OrderIntent) -> Result<OrderAck, ExecError> {
+        order.validate().map_err(|e| ExecError::Rejected {
+            venue: VenueId::Polymarket,
+            reason: e.to_string(),
+        })?;
+
+        let token_id = self
+            .symbols
+            .lookup(VenueId::Polymarket, &order.contract, order.outcome)
+            .ok_or_else(|| ExecError::Rejected {
+                venue: VenueId::Polymarket,
+                reason: format!(
+                    "no venue symbol mapping registered for {} ({:?}) — subscribe before trading it",
+                    order.contract, order.outcome
+                ),
+            })?;
+
+        self.rate_limiter.acquire().await;
+
+        let caps = self.capabilities();
+        let rounded_price = round_price(order.price, caps.min_tick, order.side);
+        let lot =
+            round_lot(order.size, caps.min_order_size).ok_or_else(|| ExecError::Rejected {
+                venue: VenueId::Polymarket,
+                reason: format!(
+                    "size {} rounds below the venue minimum {}",
+                    order.size, caps.min_order_size
+                ),
+            })?;
+        let client_order_id = ClientOrderId::derive(&order);
+
         let order_json = serde_json::json!({
-            "tokenID": order.contract.0,
-            "price": order.price,
-            "size": order.size,
+            "tokenID": token_id,
+            "price": rounded_price,
+            "size": lot,
             "side": if order.side == parallax_types::Side::Buy { "BUY" } else { "SELL" },
+            "clientOrderId": client_order_id.0,
+            // `orderType` was previously dropped entirely — an IOC would
+            // have rested indefinitely instead of canceling its unfilled
+            // remainder (design doc review 3.15). GTC/FOK naming follows
+            // Polymarket's CLOB docs as of 2026-08; re-verify before use.
+            "orderType": match order.order_type {
+                OrderType::Limit => "GTC",
+                OrderType::ImmediateOrCancel => "FOK",
+            },
         });
         let _signed =
             self.signer
@@ -227,7 +269,19 @@ impl VenueAdapter for PolymarketAdapter {
         })
     }
 
+    /// Gated behind the signer with the same discipline as `submit`
+    /// (design doc review 3.5): a market maker that cannot cancel
+    /// accumulates resting ladders it can never retract.
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError> {
+        self.rate_limiter.acquire().await;
+        let cancel_json = serde_json::json!({ "orderID": order_id.0 });
+        let _signed =
+            self.signer
+                .sign_order(&cancel_json)
+                .map_err(|reason| ExecError::Rejected {
+                    venue: VenueId::Polymarket,
+                    reason,
+                })?;
         Err(ExecError::NotFound(order_id))
     }
 }
@@ -259,22 +313,62 @@ mod tests {
         assert!(parse_book(&json).is_err());
     }
 
-    #[tokio::test]
-    async fn submit_refuses_without_a_configured_signer() {
-        let adapter = PolymarketAdapter::new(Arc::new(UnconfiguredPolymarketSigner));
-        let order = OrderIntent {
+    fn sample_order() -> OrderIntent {
+        OrderIntent {
             venue: VenueId::Polymarket,
             contract: parallax_types::CanonicalContractId(
-                "wx.temp.chicago.gt.869.2026-08-12.nws_official".into(),
+                "wx.temp.chicago.gt_869.2026-08-12.nws_official".into(),
             ),
             outcome: parallax_types::Outcome::Yes,
             side: parallax_types::Side::Buy,
             price: 0.6,
             size: 10.0,
-            order_type: parallax_types::OrderType::Limit,
+            order_type: OrderType::Limit,
             engine: parallax_types::EngineId::MarketMaking,
             created_at: parallax_types::Timestamp::from_nanos(0),
-        };
-        assert!(adapter.submit(order).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_without_a_configured_signer() {
+        let adapter = PolymarketAdapter::new(
+            Arc::new(UnconfiguredPolymarketSigner),
+            Arc::new(SymbolRegistry::new()),
+        );
+        assert!(adapter.submit(sample_order()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_when_no_symbol_mapping_is_registered() {
+        struct AlwaysSigns;
+        impl PolymarketOrderSigner for AlwaysSigns {
+            fn sign_order(&self, order_json: &Value) -> Result<PolymarketSignedOrder, String> {
+                Ok(PolymarketSignedOrder {
+                    signed_order_json: order_json.clone(),
+                    poly_address: "0x0".into(),
+                    poly_signature: "sig".into(),
+                    poly_timestamp: "0".into(),
+                    poly_api_key: "key".into(),
+                    poly_passphrase: "pass".into(),
+                })
+            }
+        }
+        let adapter =
+            PolymarketAdapter::new(Arc::new(AlwaysSigns), Arc::new(SymbolRegistry::new()));
+        match adapter.submit(sample_order()).await {
+            Err(ExecError::Rejected { reason, .. }) => {
+                assert!(reason.contains("no venue symbol mapping"))
+            }
+            other => panic!("expected a symbol-mapping rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_without_a_configured_signer() {
+        let adapter = PolymarketAdapter::new(
+            Arc::new(UnconfiguredPolymarketSigner),
+            Arc::new(SymbolRegistry::new()),
+        );
+        assert!(adapter.cancel(OrderId("x".into())).await.is_err());
     }
 }

@@ -1,8 +1,11 @@
 use crate::adapter::VenueAdapter;
+use crate::http::{client, json_or_error, RateLimiter};
+use crate::rounding::{round_lot, round_price};
+use crate::symbol_registry::SymbolRegistry;
 use async_trait::async_trait;
 use parallax_types::{
-    ExecError, OrderAck, OrderId, OrderIntent, OrderType, SettlementModel, Side, VenueCapabilities,
-    VenueId,
+    ClientOrderId, ExecError, OrderAck, OrderId, OrderIntent, OrderType, SettlementModel, Side,
+    Timestamp, VenueCapabilities, VenueId,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -55,27 +58,37 @@ pub struct KalshiAdapter {
     http: reqwest::Client,
     base_url: String,
     signer: Arc<dyn KalshiRequestSigner>,
+    symbols: Arc<SymbolRegistry>,
+    rate_limiter: RateLimiter,
 }
 
 impl KalshiAdapter {
     /// `base_url` defaults to the production REST host documented at
     /// docs.kalshi.com/getting_started/api_environments as of 2026-08:
     /// `https://external-api.kalshi.com/trade-api/v2`. Override for the
-    /// demo/sandbox environment during testing.
-    pub fn new(signer: Arc<dyn KalshiRequestSigner>) -> Self {
+    /// demo/sandbox environment during testing. `symbols` is shared with
+    /// whatever subscribes to Kalshi's listings, so a mapping populated
+    /// there is immediately visible to submission here (design doc review
+    /// 1.6).
+    pub fn new(signer: Arc<dyn KalshiRequestSigner>, symbols: Arc<SymbolRegistry>) -> Self {
         KalshiAdapter {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("failed to build HTTP client"),
+            http: client(),
             base_url: "https://external-api.kalshi.com/trade-api/v2".to_string(),
             signer,
+            symbols,
+            // Published limit is higher; this self-throttles well below it
+            // rather than skating against it (design doc review 3.4).
+            rate_limiter: RateLimiter::new(8),
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
+    }
+
+    pub fn symbols(&self) -> &SymbolRegistry {
+        &self.symbols
     }
 
     /// `GET /markets?series_ticker=...&status=open` — public,
@@ -88,6 +101,7 @@ impl KalshiAdapter {
         series_ticker: &str,
         limit: u32,
     ) -> Result<Value, ExecError> {
+        self.rate_limiter.acquire().await;
         let url = format!("{}/markets", self.base_url);
         let resp = self
             .http
@@ -100,17 +114,13 @@ impl KalshiAdapter {
                 venue: VenueId::Kalshi,
                 message: e.to_string(),
             })?;
-        resp.json::<Value>()
-            .await
-            .map_err(|e| ExecError::Connection {
-                venue: VenueId::Kalshi,
-                message: e.to_string(),
-            })
+        json_or_error(resp, VenueId::Kalshi).await
     }
 
     /// `GET /markets/{ticker}/orderbook` — public, unauthenticated.
     /// Returns the raw JSON body; use `parse_orderbook` to normalize it.
     pub async fn fetch_orderbook_raw(&self, ticker: &str) -> Result<Value, ExecError> {
+        self.rate_limiter.acquire().await;
         let url = format!("{}/markets/{}/orderbook", self.base_url, ticker);
         let resp = self
             .http
@@ -121,12 +131,7 @@ impl KalshiAdapter {
                 venue: VenueId::Kalshi,
                 message: e.to_string(),
             })?;
-        resp.json::<Value>()
-            .await
-            .map_err(|e| ExecError::Connection {
-                venue: VenueId::Kalshi,
-                message: e.to_string(),
-            })
+        json_or_error(resp, VenueId::Kalshi).await
     }
 }
 
@@ -176,7 +181,7 @@ fn best_level(levels: &[Value]) -> Option<(f64, f64)> {
             let size = number_at(arr, 1)?;
             Some((price, size))
         })
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+        .max_by(|a, b| a.0.total_cmp(&b.0))
 }
 
 fn number_at(arr: &[Value], idx: usize) -> Option<f64> {
@@ -198,27 +203,45 @@ impl VenueAdapter for KalshiAdapter {
             // Kalshi quotes in whole cents -> 0.01 in probability space.
             min_tick: 0.01,
             min_order_size: 1.0,
-            // Kalshi's fee schedule is a nonlinear per-contract curve, not
-            // a flat bps rate — this placeholder must be replaced with
-            // the real fee function before any PnL estimate is trusted.
-            maker_fee_bps: 0.0,
-            taker_fee_bps: 0.0,
+            fee_model: parallax_types::FeeModel::kalshi_default(),
             rate_limit_per_sec: 10,
         }
     }
 
-    /// Structurally complete (auth header derivation, request body shape)
-    /// but deliberately does not perform the live HTTP call yet: the
-    /// order-creation payload shape below is reconstructed from public
-    /// documentation rather than exercised against a live endpoint, and
-    /// shipping unverified field names against an endpoint that moves
-    /// real money is the wrong tradeoff for a reference implementation.
-    /// Wire up the final `self.http.post(...)` call once the body has
-    /// been confirmed against the current API reference (or the venue's
-    /// official SDK) and tested against the demo/sandbox environment.
+    /// Structurally complete (auth header derivation, request body shape,
+    /// idempotency key, venue symbol lookup) but deliberately does not
+    /// perform the live HTTP call yet: the order-creation payload shape
+    /// below is reconstructed from public documentation rather than
+    /// exercised against a live endpoint, and shipping unverified field
+    /// names against an endpoint that moves real money is the wrong
+    /// tradeoff for a reference implementation. Wire up the final
+    /// `self.http.post(...)` call once the body has been confirmed
+    /// against the current API reference (or the venue's official SDK)
+    /// and tested against the demo/sandbox environment.
     async fn submit(&self, order: OrderIntent) -> Result<OrderAck, ExecError> {
+        order.validate().map_err(|e| ExecError::Rejected {
+            venue: VenueId::Kalshi,
+            reason: e.to_string(),
+        })?;
+
+        let symbol = self
+            .symbols
+            .lookup(VenueId::Kalshi, &order.contract, order.outcome)
+            .ok_or_else(|| ExecError::Rejected {
+                venue: VenueId::Kalshi,
+                reason: format!(
+                    "no venue symbol mapping registered for {} ({:?}) — subscribe before trading it",
+                    order.contract, order.outcome
+                ),
+            })?;
+
+        self.rate_limiter.acquire().await;
+
         let path = "/portfolio/orders";
-        let timestamp_ms = order.created_at.as_nanos() / 1_000_000;
+        // Signed at send time, not `order.created_at`: a queued order
+        // carries a stale timestamp and would be rejected by the venue's
+        // signature window (design doc review 3.16).
+        let timestamp_ms = Timestamp::now().as_nanos() / 1_000_000;
         let _headers = self
             .signer
             .sign("POST", path, timestamp_ms)
@@ -227,6 +250,18 @@ impl VenueAdapter for KalshiAdapter {
                 reason,
             })?;
 
+        let caps = self.capabilities();
+        let rounded_price = round_price(order.price, caps.min_tick, order.side);
+        let lot =
+            round_lot(order.size, caps.min_order_size).ok_or_else(|| ExecError::Rejected {
+                venue: VenueId::Kalshi,
+                reason: format!(
+                    "size {} rounds below the venue minimum {}",
+                    order.size, caps.min_order_size
+                ),
+            })?;
+        let client_order_id = ClientOrderId::derive(&order);
+
         // Field names below follow docs.kalshi.com/api-reference/orders/create-order-v2
         // as researched 2026-08: `ticker`, `client_order_id`, `side`
         // ("yes"/"no"), `action` ("buy"/"sell"), `count`, `type`
@@ -234,15 +269,22 @@ impl VenueAdapter for KalshiAdapter {
         // This must be re-verified against the live schema before use —
         // Kalshi has changed this payload shape between API versions.
         let _body = serde_json::json!({
-            "ticker": order.contract.0,
+            "ticker": symbol,
+            "client_order_id": client_order_id.0,
             "action": if order.side == Side::Buy { "buy" } else { "sell" },
-            "side": "yes",
-            "count": order.size as i64,
+            // The venue's `side` field is the outcome (YES/NO), not the
+            // buy/sell action — hardcoding "yes" here submitted every NO
+            // order as YES (design doc review 3.14).
+            "side": match order.outcome {
+                parallax_types::Outcome::Yes => "yes",
+                parallax_types::Outcome::No => "no",
+            },
+            "count": lot,
             "type": match order.order_type {
                 OrderType::Limit => "limit",
                 OrderType::ImmediateOrCancel => "limit",
             },
-            "price": (order.price * 100.0).round() as i64,
+            "price": (rounded_price * 100.0).round() as i64,
             "time_in_force": match order.order_type {
                 OrderType::Limit => "resting",
                 OrderType::ImmediateOrCancel => "immediate_or_cancel",
@@ -255,7 +297,21 @@ impl VenueAdapter for KalshiAdapter {
         })
     }
 
+    /// Gated behind the signer with the same discipline as `submit` — a
+    /// market maker that cannot cancel accumulates resting ladders it can
+    /// never retract, which is as safety-critical as submission itself
+    /// (design doc review 3.5).
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError> {
+        let path = format!("/portfolio/orders/{}", order_id.0);
+        self.rate_limiter.acquire().await;
+        let timestamp_ms = Timestamp::now().as_nanos() / 1_000_000;
+        let _headers = self
+            .signer
+            .sign("DELETE", &path, timestamp_ms)
+            .map_err(|reason| ExecError::Rejected {
+                venue: VenueId::Kalshi,
+                reason,
+            })?;
         Err(ExecError::NotFound(order_id))
     }
 }
@@ -303,13 +359,11 @@ mod tests {
         assert!(parse_orderbook(&json).is_err());
     }
 
-    #[tokio::test]
-    async fn submit_refuses_without_a_configured_signer() {
-        let adapter = KalshiAdapter::new(Arc::new(UnconfiguredKalshiSigner));
-        let order = OrderIntent {
+    fn sample_order() -> OrderIntent {
+        OrderIntent {
             venue: VenueId::Kalshi,
             contract: parallax_types::CanonicalContractId(
-                "wx.temp.chicago.gt.869.2026-08-12.nws_official".into(),
+                "wx.temp.chicago.gt_869.2026-08-12.nws_official".into(),
             ),
             outcome: parallax_types::Outcome::Yes,
             side: Side::Buy,
@@ -318,11 +372,57 @@ mod tests {
             order_type: OrderType::Limit,
             engine: parallax_types::EngineId::MarketMaking,
             created_at: parallax_types::Timestamp::from_nanos(0),
-        };
-        let result = adapter.submit(order).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_without_a_configured_signer() {
+        let adapter = KalshiAdapter::new(
+            Arc::new(UnconfiguredKalshiSigner),
+            Arc::new(SymbolRegistry::new()),
+        );
+        let result = adapter.submit(sample_order()).await;
         assert!(
             result.is_err(),
             "submit must refuse to send a live order with no signer configured"
         );
+    }
+
+    #[tokio::test]
+    async fn submit_refuses_when_no_symbol_mapping_is_registered() {
+        struct AlwaysSigns;
+        impl KalshiRequestSigner for AlwaysSigns {
+            fn sign(
+                &self,
+                _: &str,
+                _: &str,
+                timestamp_ms: i64,
+            ) -> Result<KalshiAuthHeaders, String> {
+                Ok(KalshiAuthHeaders {
+                    access_key: "k".into(),
+                    timestamp_ms,
+                    signature_base64: "sig".into(),
+                })
+            }
+        }
+        let adapter = KalshiAdapter::new(Arc::new(AlwaysSigns), Arc::new(SymbolRegistry::new()));
+        match adapter.submit(sample_order()).await {
+            Err(ExecError::Rejected { reason, .. }) => {
+                assert!(reason.contains("no venue symbol mapping"))
+            }
+            other => panic!("expected a symbol-mapping rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_without_a_configured_signer() {
+        let adapter = KalshiAdapter::new(
+            Arc::new(UnconfiguredKalshiSigner),
+            Arc::new(SymbolRegistry::new()),
+        );
+        match adapter.cancel(OrderId("x".into())).await {
+            Err(ExecError::Rejected { .. }) => {}
+            other => panic!("expected Rejected (unconfigured signer), got {other:?}"),
+        }
     }
 }

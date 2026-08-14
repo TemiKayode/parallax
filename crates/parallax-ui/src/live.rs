@@ -9,7 +9,7 @@
 
 use parallax_venues::{
     parse_kalshi_orderbook, parse_polymarket_book, KalshiAdapter, PolymarketAdapter,
-    UnconfiguredKalshiSigner, UnconfiguredPolymarketSigner,
+    SymbolRegistry, UnconfiguredKalshiSigner, UnconfiguredPolymarketSigner,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -31,7 +31,10 @@ pub struct LiveQuote {
 /// repo's synthetic demo scenario is modeled on) and fetches its live
 /// order book.
 pub async fn fetch_live_kalshi() -> Result<LiveQuote, String> {
-    let adapter = KalshiAdapter::new(Arc::new(UnconfiguredKalshiSigner));
+    let adapter = KalshiAdapter::new(
+        Arc::new(UnconfiguredKalshiSigner),
+        Arc::new(SymbolRegistry::new()),
+    );
 
     let markets = adapter
         .fetch_open_markets_for_series_raw("KXHIGHCHI", 1)
@@ -87,7 +90,10 @@ pub async fn fetch_live_kalshi() -> Result<LiveQuote, String> {
 /// market, so this shows real connectivity to a real, live, independent
 /// market rather than forcing a misleading "same contract" comparison.
 pub async fn fetch_live_polymarket() -> Result<LiveQuote, String> {
-    let adapter = PolymarketAdapter::new(Arc::new(UnconfiguredPolymarketSigner));
+    let adapter = PolymarketAdapter::new(
+        Arc::new(UnconfiguredPolymarketSigner),
+        Arc::new(SymbolRegistry::new()),
+    );
 
     let markets = adapter
         .fetch_active_markets_raw(10)

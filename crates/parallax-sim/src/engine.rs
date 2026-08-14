@@ -2,8 +2,8 @@ use crate::replay::ReplayEvent;
 use crate::report::BacktestReport;
 use parallax_alpha::{aggregate, AggregatorConfig, AlphaSource};
 use parallax_book::ConsolidatedBook;
-use parallax_risk::{RiskGate, RiskLimits};
-use parallax_strategy::{Calibrator, StrategyCore, StrategyEngine, StrategyInput};
+use parallax_risk::{RejectReason, RiskGate, RiskLimits};
+use parallax_strategy::{Calibrator, FillOutcome, StrategyCore, StrategyEngine, StrategyInput};
 use parallax_types::{
     AckStatus, CanonicalContractId, ClusterKey, OrderId, OrderIntent, ProbabilityEstimate,
     Timestamp,
@@ -44,7 +44,10 @@ impl Backtest {
     ) -> Self {
         Backtest {
             book: ConsolidatedBook::new(),
-            risk: RiskGate::new(risk_limits),
+            // Flat really is the starting truth for a backtest — there is
+            // no real venue position to reconcile against (design doc
+            // review 1.8).
+            risk: RiskGate::new_presumed_flat(risk_limits),
             strategy: StrategyCore::new(engines),
             calibrator: Calibrator::default(),
             venue: Arc::new(PaperAdapter::new()),
@@ -77,6 +80,10 @@ impl Backtest {
         let contract = tick.contract.clone();
         let now = tick.receive_ts;
         self.book.update(tick.clone());
+        if self.book.rejected_ticks() > 0 {
+            // Surfaced via the report; a rising count means the feed
+            // shape changed (design doc review 1.1/GO_LIVE §2).
+        }
 
         let fills = self.venue.advance_market(
             contract.clone(),
@@ -87,7 +94,9 @@ impl Backtest {
             now,
         );
         for ack in fills {
-            self.apply_ack(&ack);
+            // Every fill reaching here came from a *resting* order being
+            // hit by this tick — a maker fill, by construction.
+            self.apply_ack(&ack, true);
         }
 
         self.recompute_and_trade(&contract, now).await;
@@ -107,6 +116,9 @@ impl Backtest {
                 continue;
             }
             if let Some(estimate) = source.on_event(&event) {
+                if estimate.validate().is_err() {
+                    continue;
+                }
                 let contract = estimate.contract.clone();
                 self.estimates
                     .entry(contract.clone())
@@ -129,6 +141,9 @@ impl Backtest {
         let Some(fair_value) = aggregate(contract, &estimates, &self.aggregator_config, now) else {
             return;
         };
+        if fair_value.validate().is_err() {
+            return;
+        }
 
         let inventory = self.risk.inventory_for(contract);
         let proposals = {
@@ -147,65 +162,134 @@ impl Backtest {
         let results = self.risk.check_batch(&proposals, &self.book, now);
         for (intent, result) in proposals.into_iter().zip(results) {
             match result {
-                Err(_reason) => self.report.orders_rejected_by_risk += 1,
-                Ok(()) => self.submit_and_track(intent).await,
+                Err(reason) => self.report.record_rejection(reject_reason_label(&reason)),
+                Ok(()) => {
+                    // Reserved immediately, before submission — a working
+                    // order is real exposure the instant it's live, and
+                    // the next proposal in this same batch must see it
+                    // (design doc review 1.2).
+                    self.risk.reserve(&intent);
+                    self.submit_and_track(intent).await;
+                }
             }
         }
     }
 
     async fn submit_and_track(&mut self, intent: OrderIntent) {
         match self.venue.submit(intent.clone()).await {
-            Err(_) => self.report.orders_failed_submission += 1,
+            Err(_) => {
+                self.report.orders_failed_submission += 1;
+                self.calibrator
+                    .record_outcome(intent.venue, FillOutcome::Rejected, None);
+                // Submission itself failed: nothing is working at the
+                // venue, so the reservation taken above must come back off.
+                self.risk.release(&intent);
+            }
             Ok(ack) => {
                 self.outstanding.insert(ack.order_id.clone(), intent);
-                self.apply_ack(&ack);
+                // The ack from `submit` itself, if it fills anything,
+                // reflects an aggressive/immediate cross — a taker fill.
+                self.apply_ack(&ack, false);
             }
         }
     }
 
-    fn apply_ack(&mut self, ack: &parallax_types::OrderAck) {
+    fn apply_ack(&mut self, ack: &parallax_types::OrderAck, is_maker: bool) {
         let Some(intent) = self.outstanding.get(&ack.order_id).cloned() else {
             return;
         };
 
         match &ack.status {
             AckStatus::Filled { qty, price } => {
-                self.record_fill(&intent, *qty, *price);
+                self.record_fill(&intent, *qty, *price, is_maker);
+                self.risk.reduce_reservation(&intent, *qty);
                 self.outstanding.remove(&ack.order_id);
             }
             AckStatus::PartiallyFilled {
                 filled_qty, price, ..
             } => {
-                self.record_fill(&intent, *filled_qty, *price);
+                self.record_fill(&intent, *filled_qty, *price, is_maker);
+                self.risk.reduce_reservation(&intent, *filled_qty);
                 // still resting at the venue under the same order id
             }
             AckStatus::Rejected { .. } => {
-                self.calibrator.record_outcome(intent.venue, false, None);
+                // An accepted order that found no crossing liquidity — a
+                // genuine illiquidity signal, kept distinct from a
+                // submission-level rejection (design doc review 2.15).
+                self.calibrator
+                    .record_outcome(intent.venue, FillOutcome::Unfilled, None);
+                self.risk.release(&intent);
                 self.outstanding.remove(&ack.order_id);
             }
             AckStatus::Canceled => {
+                self.risk.release(&intent);
                 self.outstanding.remove(&ack.order_id);
             }
             AckStatus::Accepted => {}
         }
     }
 
-    fn record_fill(&mut self, intent: &OrderIntent, qty: f64, price: f64) {
+    fn record_fill(&mut self, intent: &OrderIntent, qty: f64, price: f64, is_maker: bool) {
+        if qty <= 0.0 {
+            // A cancellation or a rejection must never be counted as a
+            // trade (design doc review 4.7).
+            return;
+        }
         let signed = match intent.side {
             parallax_types::Side::Buy => qty,
             parallax_types::Side::Sell => -qty,
         };
-        self.risk
-            .record_fill(intent.venue, &intent.contract, signed, price);
-        let slippage = (price - intent.price).abs();
+        let fee = self
+            .venue
+            .capabilities()
+            .fee_model
+            .fee(is_maker, qty, price);
+        let realized = self
+            .risk
+            .record_fill(intent.venue, &intent.contract, signed, price, fee);
+
+        // Signed adverse slippage: positive means the fill cost us
+        // relative to what we quoted, on either side — an unsigned
+        // `.abs()` made a venue that consistently improves our price look
+        // exactly as costly as one that consistently worsens it (design
+        // doc review 2.15).
+        let slippage = match intent.side {
+            parallax_types::Side::Buy => price - intent.price,
+            parallax_types::Side::Sell => intent.price - price,
+        };
         self.calibrator
-            .record_outcome(intent.venue, true, Some(slippage));
+            .record_outcome(intent.venue, FillOutcome::Filled, Some(slippage));
+
         self.report.fills += 1;
         self.report.filled_volume += qty;
+        self.report.gross_notional_traded += qty * price;
+        self.report.realized_pnl += realized;
+        self.report.fees_paid += fee;
+
+        let equity = self.current_equity();
+        self.risk.mark_to_market(equity);
+        self.report.record_equity(equity);
+    }
+
+    /// Realized P&L plus mark-to-model unrealized P&L on every open
+    /// position, minus fees paid so far — the number `mark_to_market`
+    /// and the equity curve are built from.
+    fn current_equity(&self) -> f64 {
+        let mut unrealized = 0.0;
+        for (_, contract, position) in self.risk.positions_snapshot() {
+            if position.is_flat() {
+                continue;
+            }
+            if let Some(mid) = self.book.consolidated_mid(&contract) {
+                unrealized += position.unrealized_pnl(mid);
+            }
+        }
+        self.report.realized_pnl - self.report.fees_paid + unrealized
     }
 
     fn finalize_report(&mut self) -> BacktestReport {
         let mut report = std::mem::take(&mut self.report);
+        report.unrealized_pnl = 0.0;
         for (venue, contract, position) in self.risk.positions_snapshot() {
             if position.is_flat() {
                 continue;
@@ -218,6 +302,28 @@ impl Backtest {
                 .push((venue, contract, position.qty, position.avg_price));
         }
         report
+    }
+}
+
+fn reject_reason_label(reason: &RejectReason) -> String {
+    // A stable, coarse-grained label per variant — enough for the
+    // rejection histogram to answer "why did trading stop" without
+    // needing every numeric field to match for aggregation to work.
+    match reason {
+        RejectReason::NotReconciled => "NotReconciled".to_string(),
+        RejectReason::KillSwitch { .. } => "KillSwitch".to_string(),
+        RejectReason::NoMarketData => "NoMarketData".to_string(),
+        RejectReason::FeedStale { .. } => "FeedStale".to_string(),
+        RejectReason::ClockSkew { .. } => "ClockSkew".to_string(),
+        RejectReason::PriceThroughBook { .. } => "PriceThroughBook".to_string(),
+        RejectReason::Invalid(_) => "Invalid".to_string(),
+        RejectReason::ContractLimitExceeded { .. } => "ContractLimitExceeded".to_string(),
+        RejectReason::ClusterLimitExceeded { .. } => "ClusterLimitExceeded".to_string(),
+        RejectReason::VenueLimitExceeded { .. } => "VenueLimitExceeded".to_string(),
+        RejectReason::GrossLimitExceeded { .. } => "GrossLimitExceeded".to_string(),
+        RejectReason::NotionalPerOrderExceeded { .. } => "NotionalPerOrderExceeded".to_string(),
+        RejectReason::NotionalVenueExceeded { .. } => "NotionalVenueExceeded".to_string(),
+        RejectReason::NotionalTotalExceeded { .. } => "NotionalTotalExceeded".to_string(),
     }
 }
 
@@ -282,6 +388,7 @@ mod tests {
             payload: serde_json::json!({
                 "contract": contract().0,
                 "threshold_tenths": 869,
+                "direction": "gt",
                 "ensemble_forecast_tenths": [920, 930, 915, 925, 918],
             }),
         };
@@ -310,6 +417,7 @@ mod tests {
             "expected at least one order proposal"
         );
         assert!(report.fills > 0, "expected the mispriced ask to get bought");
+        assert!(report.gross_notional_traded > 0.0);
 
         let net = backtest.risk.position_qty(VenueId::Polymarket, &contract());
         assert!(

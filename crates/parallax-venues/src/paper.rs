@@ -4,7 +4,7 @@ use parallax_types::{
     AckStatus, CanonicalContractId, ExecError, OrderAck, OrderId, OrderIntent, OrderType,
     SettlementModel, Side, Timestamp, VenueCapabilities, VenueId,
 };
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -16,9 +16,53 @@ struct MarketState {
     ask_size: f64,
 }
 
+/// A resting or in-flight order plus the strictly-increasing sequence
+/// number it was submitted with — the tie-breaker for price-time
+/// priority when two orders share a price (design doc review 2.3).
+#[derive(Clone)]
+struct Tracked {
+    intent: OrderIntent,
+    sequence: u64,
+}
+
 struct PaperState {
-    resting: HashMap<OrderId, OrderIntent>,
-    market: HashMap<CanonicalContractId, MarketState>,
+    resting: BTreeMap<OrderId, Tracked>,
+    /// Orders submitted but not yet "arrived" on the simulated book —
+    /// only populated when `PaperConfig::latency_ns` is nonzero. Moved
+    /// into `resting` (or resolved immediately, for an IOC) the first
+    /// time `advance_market` reports a tick at or after the order's
+    /// arrival time (design doc review 4.6).
+    pending: BTreeMap<OrderId, (Tracked, i64)>,
+    market: BTreeMap<CanonicalContractId, MarketState>,
+}
+
+/// Models the two most flattering assumptions a paper venue can make
+/// about a market maker, and lets a caller turn either off (design doc
+/// review 3.26).
+#[derive(Debug, Clone, Copy)]
+pub struct PaperConfig {
+    /// Fraction of incoming crossing liquidity assumed to already be
+    /// ahead of our resting order in the venue's real queue at that price
+    /// level. `0.0` — always at the front — is the default and the most
+    /// optimistic value available; it overstates fill probability for a
+    /// market maker, whose whole edge depends on realistic queue
+    /// position.
+    pub queue_ahead_fraction: f64,
+    /// Simulated one-way latency in nanoseconds. An order does not become
+    /// live on the simulated book until `submitted_at + latency_ns`; a
+    /// zero-latency backtest (the default) lets a strategy fill against
+    /// the exact quote it just reacted to, which no real network round
+    /// trip permits.
+    pub latency_ns: i64,
+}
+
+impl Default for PaperConfig {
+    fn default() -> Self {
+        PaperConfig {
+            queue_ahead_fraction: 0.0,
+            latency_ns: 0,
+        }
+    }
 }
 
 /// The in-memory simulated venue (design doc §4: "not a stub to be
@@ -27,27 +71,42 @@ struct PaperState {
 /// immediately for whatever size is available and rests the remainder;
 /// an IOC order fills whatever it can immediately and cancels the rest;
 /// a passive resting limit fills later when `advance_market` reports a
-/// tick that crosses it. This is what `parallax-sim` drives during
-/// replay/backtest and what shadow mode drives during live bake-in.
+/// tick that crosses it, at *its own* price, not the crossing tick's
+/// price (design doc review 2.2). This is what `parallax-sim` drives
+/// during replay/backtest and what shadow mode drives during live
+/// bake-in.
 pub struct PaperAdapter {
     state: Mutex<PaperState>,
     next_id: AtomicU64,
+    next_sequence: AtomicU64,
+    config: PaperConfig,
 }
 
 impl PaperAdapter {
     pub fn new() -> Self {
+        Self::with_config(PaperConfig::default())
+    }
+
+    pub fn with_config(config: PaperConfig) -> Self {
         PaperAdapter {
             state: Mutex::new(PaperState {
-                resting: HashMap::new(),
-                market: HashMap::new(),
+                resting: BTreeMap::new(),
+                pending: BTreeMap::new(),
+                market: BTreeMap::new(),
             }),
             next_id: AtomicU64::new(1),
+            next_sequence: AtomicU64::new(1),
+            config,
         }
     }
 
     fn next_order_id(&self) -> OrderId {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
         OrderId(format!("paper-{n}"))
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.next_sequence.fetch_add(1, Ordering::Relaxed)
     }
 
     fn try_immediate_match(market: Option<&MarketState>, intent: &OrderIntent) -> (f64, f64) {
@@ -58,19 +117,165 @@ impl PaperAdapter {
         }
     }
 
+    /// `rest_remainder` is `true` for a `Limit` order (any unfilled size
+    /// rests) and `false` for an IOC (any unfilled size is canceled,
+    /// never rested) — this is what governs the zero-fill case too: a
+    /// `Limit` order that hasn't crossed yet is `Accepted` and rested in
+    /// full, not rejected, which only applies to an IOC that found
+    /// nothing to take.
+    fn ack_for_immediate_result(
+        order_id: OrderId,
+        intent: &OrderIntent,
+        filled_qty: f64,
+        fill_price: f64,
+        rest_remainder: bool,
+    ) -> (OrderAck, Option<Tracked>, Option<f64>) {
+        let remaining = intent.size - filled_qty;
+        let ts = intent.created_at;
+
+        if filled_qty <= 0.0 {
+            return if rest_remainder {
+                (
+                    OrderAck {
+                        order_id,
+                        venue: VenueId::Paper,
+                        status: AckStatus::Accepted,
+                        ts,
+                    },
+                    Some(Tracked {
+                        intent: intent.clone(),
+                        sequence: 0, // caller overwrites with a real sequence before storing
+                    }),
+                    Some(intent.size),
+                )
+            } else {
+                (
+                    OrderAck {
+                        order_id,
+                        venue: VenueId::Paper,
+                        status: AckStatus::Rejected {
+                            reason: "no crossing liquidity available".into(),
+                        },
+                        ts,
+                    },
+                    None,
+                    None,
+                )
+            };
+        }
+
+        if remaining > 1e-9 {
+            let status = AckStatus::PartiallyFilled {
+                filled_qty,
+                remaining_qty: remaining,
+                price: fill_price,
+            };
+            if rest_remainder {
+                (
+                    OrderAck {
+                        order_id,
+                        venue: VenueId::Paper,
+                        status,
+                        ts,
+                    },
+                    Some(Tracked {
+                        intent: intent.clone(),
+                        sequence: 0,
+                    }),
+                    Some(remaining),
+                )
+            } else {
+                // IOC: whatever didn't fill is canceled, not rested.
+                (
+                    OrderAck {
+                        order_id,
+                        venue: VenueId::Paper,
+                        status,
+                        ts,
+                    },
+                    None,
+                    None,
+                )
+            }
+        } else {
+            (
+                OrderAck {
+                    order_id,
+                    venue: VenueId::Paper,
+                    status: AckStatus::Filled {
+                        qty: filled_qty,
+                        price: fill_price,
+                    },
+                    ts,
+                },
+                None,
+                None,
+            )
+        }
+    }
+
+    /// Activates every pending order for `contract` whose arrival time
+    /// has passed, evaluating each against `market` (the tick that just
+    /// arrived) exactly once: an IOC fills-or-cancels immediately, a
+    /// limit that crosses fills/partially fills, and a limit that doesn't
+    /// cross starts resting from this point on. Never activates an order
+    /// against a market snapshot from before it was actually live —
+    /// that's the zero-latency snipe this whole mechanism exists to rule
+    /// out.
+    fn activate_pending(
+        state: &mut PaperState,
+        contract: &CanonicalContractId,
+        market: MarketState,
+        now: Timestamp,
+    ) -> Vec<OrderAck> {
+        let ready_ids: Vec<OrderId> = state
+            .pending
+            .iter()
+            .filter(|(_, (t, arrival))| {
+                &t.intent.contract == contract && *arrival <= now.as_nanos()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let mut acks = Vec::new();
+        for id in ready_ids {
+            let (tracked, _arrival) = state.pending.remove(&id).unwrap();
+            let (filled_qty, fill_price) =
+                Self::try_immediate_match(Some(&market), &tracked.intent);
+            let rest_remainder = matches!(tracked.intent.order_type, OrderType::Limit);
+            let (ack, to_rest, remaining) = Self::ack_for_immediate_result(
+                id.clone(),
+                &tracked.intent,
+                filled_qty,
+                fill_price,
+                rest_remainder,
+            );
+            if let (Some(mut t), Some(remaining_qty)) = (to_rest, remaining) {
+                t.sequence = tracked.sequence;
+                t.intent.size = remaining_qty;
+                state.resting.insert(id, t);
+            }
+            acks.push(ack);
+        }
+        acks
+    }
+
     /// Feed the venue's current best bid/ask for a contract — called by
     /// the sim harness on each replayed tick, or by a live market-data
-    /// task in shadow mode. Returns any fills this update triggers
-    /// against previously-resting orders.
+    /// task in shadow mode. Returns every ack this update triggers: fills
+    /// against previously-resting orders, activations/resolutions of
+    /// orders whose simulated latency has just elapsed, at most one per
+    /// order per call.
     ///
-    /// Resting orders competing for the same side are matched against a
-    /// running remaining-liquidity counter (not the raw incoming size
-    /// repeatedly) — otherwise two resting orders on the same side would
-    /// each independently "see" the full quoted size and could jointly
-    /// report filling far more than the venue actually offered. The
-    /// depleted size is what gets stored as this tick's market state, so
-    /// a later `submit()` call before the next tick sees what's actually
-    /// left rather than the original undiminished quote.
+    /// Resting orders competing for the same side are matched in
+    /// price-time priority — sorted by price advantage, then by
+    /// submission sequence — against a running remaining-liquidity
+    /// counter, itself first haircut by `PaperConfig::queue_ahead_fraction`
+    /// to model liquidity already claimed by other participants ahead of
+    /// us in the real queue. `BTreeMap`, not `HashMap`: iteration order
+    /// must not depend on the process's hash seed, or the same input
+    /// produces a different fill allocation — and therefore a different
+    /// P&L — between runs (design doc review 2.3).
     pub fn advance_market(
         &self,
         contract: CanonicalContractId,
@@ -80,21 +285,41 @@ impl PaperAdapter {
         ask_size: f64,
         now: Timestamp,
     ) -> Vec<OrderAck> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let market = MarketState {
+            bid,
+            bid_size,
+            ask,
+            ask_size,
+        };
 
-        let candidate_ids: Vec<OrderId> = state
+        let mut acks = Self::activate_pending(&mut state, &contract, market, now);
+
+        let mut candidates: Vec<(OrderId, Tracked)> = state
             .resting
             .iter()
-            .filter(|(_, o)| o.contract == contract)
-            .map(|(id, _)| id.clone())
+            .filter(|(_, t)| t.intent.contract == contract)
+            .map(|(id, t)| (id.clone(), t.clone()))
             .collect();
+        candidates.sort_by(|(_, a), (_, b)| match a.intent.side {
+            Side::Buy => b
+                .intent
+                .price
+                .total_cmp(&a.intent.price)
+                .then(a.sequence.cmp(&b.sequence)),
+            Side::Sell => a
+                .intent
+                .price
+                .total_cmp(&b.intent.price)
+                .then(a.sequence.cmp(&b.sequence)),
+        });
 
-        let mut remaining_ask_size = ask_size;
-        let mut remaining_bid_size = bid_size;
-        let mut fills = Vec::new();
+        let queue_haircut = 1.0 - self.config.queue_ahead_fraction.clamp(0.0, 1.0);
+        let mut remaining_ask_size = ask_size * queue_haircut;
+        let mut remaining_bid_size = bid_size * queue_haircut;
 
-        for id in candidate_ids {
-            let intent = state.resting.get(&id).cloned().unwrap();
+        for (id, tracked) in candidates {
+            let intent = &tracked.intent;
             let crosses = match intent.side {
                 Side::Buy => ask <= intent.price,
                 Side::Sell => bid >= intent.price,
@@ -102,9 +327,9 @@ impl PaperAdapter {
             if !crosses {
                 continue;
             }
-            let (fill_price, avail) = match intent.side {
-                Side::Buy => (ask, &mut remaining_ask_size),
-                Side::Sell => (bid, &mut remaining_bid_size),
+            let avail = match intent.side {
+                Side::Buy => &mut remaining_ask_size,
+                Side::Sell => &mut remaining_bid_size,
             };
             let filled_qty = intent.size.min(*avail);
             if filled_qty <= 0.0 {
@@ -112,14 +337,20 @@ impl PaperAdapter {
             }
             *avail -= filled_qty;
 
+            // A resting order fills at *its own* limit price when hit —
+            // not the aggressor's price. Filling a resting bid at the
+            // incoming ask handed every passive fill free price
+            // improvement in every backtest (design doc review 2.2).
+            let fill_price = intent.price;
+
             if filled_qty + 1e-9 < intent.size {
-                let mut remainder = intent.clone();
-                remainder.size -= filled_qty;
+                let mut remainder = tracked.clone();
+                remainder.intent.size -= filled_qty;
                 state.resting.insert(id.clone(), remainder);
             } else {
                 state.resting.remove(&id);
             }
-            fills.push(OrderAck {
+            acks.push(OrderAck {
                 order_id: id,
                 venue: VenueId::Paper,
                 status: AckStatus::Filled {
@@ -130,16 +361,8 @@ impl PaperAdapter {
             });
         }
 
-        state.market.insert(
-            contract,
-            MarketState {
-                bid,
-                bid_size: remaining_bid_size,
-                ask,
-                ask_size: remaining_ask_size,
-            },
-        );
-        fills
+        state.market.insert(contract, market);
+        acks
     }
 }
 
@@ -161,17 +384,52 @@ impl VenueAdapter for PaperAdapter {
             settlement: SettlementModel::Simulated,
             min_tick: 0.01,
             min_order_size: 1.0,
-            maker_fee_bps: 0.0,
-            taker_fee_bps: 0.0,
+            fee_model: parallax_types::FeeModel {
+                maker_rate: 0.0,
+                taker_rate: 0.0,
+                round_up_to: 0.0,
+            },
             rate_limit_per_sec: u32::MAX,
         }
     }
 
     async fn submit(&self, order: OrderIntent) -> Result<OrderAck, ExecError> {
-        let mut state = self.state.lock().unwrap();
+        order.validate().map_err(|e| ExecError::Rejected {
+            venue: VenueId::Paper,
+            reason: e.to_string(),
+        })?;
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let order_id = self.next_order_id();
+        let sequence = self.next_sequence();
+
+        if self.config.latency_ns > 0 {
+            // Not live yet: goes on the wire, resolved the moment
+            // `advance_market` reports a tick at or after arrival.
+            let arrival = order
+                .created_at
+                .as_nanos()
+                .saturating_add(self.config.latency_ns);
+            state.pending.insert(
+                order_id.clone(),
+                (
+                    Tracked {
+                        intent: order.clone(),
+                        sequence,
+                    },
+                    arrival,
+                ),
+            );
+            return Ok(OrderAck {
+                order_id,
+                venue: VenueId::Paper,
+                status: AckStatus::Accepted,
+                ts: order.created_at,
+            });
+        }
+
         let market = state.market.get(&order.contract).copied();
         let (filled_qty, fill_price) = Self::try_immediate_match(market.as_ref(), &order);
-        let order_id = self.next_order_id();
 
         // Deplete the resting liquidity this fill just consumed so a
         // second order submitted before the next `advance_market` call
@@ -189,79 +447,31 @@ impl VenueAdapter for PaperAdapter {
 
         match order.order_type {
             OrderType::ImmediateOrCancel => {
-                if filled_qty <= 0.0 {
-                    return Ok(OrderAck {
-                        order_id,
-                        venue: VenueId::Paper,
-                        status: AckStatus::Rejected {
-                            reason: "no crossing liquidity available".into(),
-                        },
-                        ts: order.created_at,
-                    });
-                }
-                let status = if filled_qty + 1e-9 >= order.size {
-                    AckStatus::Filled {
-                        qty: filled_qty,
-                        price: fill_price,
-                    }
-                } else {
-                    AckStatus::PartiallyFilled {
-                        filled_qty,
-                        remaining_qty: order.size - filled_qty,
-                        price: fill_price,
-                    }
-                };
-                Ok(OrderAck {
-                    order_id,
-                    venue: VenueId::Paper,
-                    status,
-                    ts: order.created_at,
-                })
+                let (ack, _, _) =
+                    Self::ack_for_immediate_result(order_id, &order, filled_qty, fill_price, false);
+                Ok(ack)
             }
             OrderType::Limit => {
-                if filled_qty > 0.0 {
-                    let remaining = order.size - filled_qty;
-                    if remaining > 1e-9 {
-                        let mut resting = order.clone();
-                        resting.size = remaining;
-                        state.resting.insert(order_id.clone(), resting);
-                        Ok(OrderAck {
-                            order_id,
-                            venue: VenueId::Paper,
-                            status: AckStatus::PartiallyFilled {
-                                filled_qty,
-                                remaining_qty: remaining,
-                                price: fill_price,
-                            },
-                            ts: order.created_at,
-                        })
-                    } else {
-                        Ok(OrderAck {
-                            order_id,
-                            venue: VenueId::Paper,
-                            status: AckStatus::Filled {
-                                qty: filled_qty,
-                                price: fill_price,
-                            },
-                            ts: order.created_at,
-                        })
-                    }
-                } else {
-                    state.resting.insert(order_id.clone(), order.clone());
-                    Ok(OrderAck {
-                        order_id,
-                        venue: VenueId::Paper,
-                        status: AckStatus::Accepted,
-                        ts: order.created_at,
-                    })
+                let (ack, to_rest, remaining) = Self::ack_for_immediate_result(
+                    order_id.clone(),
+                    &order,
+                    filled_qty,
+                    fill_price,
+                    true,
+                );
+                if let (Some(mut t), Some(remaining_qty)) = (to_rest, remaining) {
+                    t.sequence = sequence;
+                    t.intent.size = remaining_qty;
+                    state.resting.insert(order_id, t);
                 }
+                Ok(ack)
             }
         }
     }
 
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError> {
-        let mut state = self.state.lock().unwrap();
-        if state.resting.remove(&order_id).is_some() {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.resting.remove(&order_id).is_some() || state.pending.remove(&order_id).is_some() {
             Ok(())
         } else {
             Err(ExecError::NotFound(order_id))
@@ -441,6 +651,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resting_order_fills_at_its_own_price_not_the_crossing_ticks_price() {
+        // Regression for design doc review 2.2: a resting bid at 0.58,
+        // hit by a tick whose ask has dropped all the way to 0.40, must
+        // still fill at 0.58 (its own price) — not 0.40, which would be
+        // free price improvement no real resting order receives.
+        let venue = PaperAdapter::new();
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        venue
+            .submit(order(Side::Buy, 0.58, 15.0, OrderType::Limit))
+            .await
+            .unwrap();
+
+        let fills = venue.advance_market(
+            contract(),
+            0.35,
+            100.0,
+            0.40,
+            100.0,
+            Timestamp::from_nanos(1),
+        );
+        assert_eq!(fills.len(), 1);
+        match &fills[0].status {
+            AckStatus::Filled { price, .. } => assert_eq!(*price, 0.58),
+            other => panic!("expected Filled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn cancel_removes_a_resting_order() {
         let venue = PaperAdapter::new();
         venue.advance_market(
@@ -516,5 +761,131 @@ mod tests {
         );
         assert_eq!(fills.len(), 1);
         assert!(matches!(fills[0].status, AckStatus::Filled { qty, .. } if qty == 20.0));
+    }
+
+    #[tokio::test]
+    async fn two_resting_buys_are_filled_in_price_priority_not_arrival_order() {
+        let venue = PaperAdapter::new();
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.70,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        // Worse price submitted first.
+        let worse = venue
+            .submit(order(Side::Buy, 0.61, 10.0, OrderType::Limit))
+            .await
+            .unwrap();
+        let better = venue
+            .submit(order(Side::Buy, 0.65, 10.0, OrderType::Limit))
+            .await
+            .unwrap();
+        assert_eq!(worse.status, AckStatus::Accepted);
+        assert_eq!(better.status, AckStatus::Accepted);
+
+        // Only 10 units of crossing liquidity arrive — the better (higher)
+        // price should win it regardless of submission order.
+        let fills = venue.advance_market(
+            contract(),
+            0.50,
+            100.0,
+            0.60,
+            10.0,
+            Timestamp::from_nanos(1),
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, better.order_id);
+    }
+
+    #[tokio::test]
+    async fn latency_prevents_sniping_a_quote_that_was_already_gone_on_arrival() {
+        let venue = PaperAdapter::with_config(PaperConfig {
+            queue_ahead_fraction: 0.0,
+            latency_ns: 1_000_000_000, // 1s
+        });
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            50.0,
+            Timestamp::from_nanos(0),
+        );
+
+        let mut ioc = order(Side::Buy, 0.65, 20.0, OrderType::ImmediateOrCancel);
+        ioc.created_at = Timestamp::from_nanos(0);
+        let ack = venue.submit(ioc).await.unwrap();
+        // Not resolved yet: the order is still in flight.
+        assert_eq!(ack.status, AckStatus::Accepted);
+
+        // Before arrival, no resolution.
+        let acks = venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            50.0,
+            Timestamp::from_nanos(500_000_000),
+        );
+        assert!(acks.is_empty());
+
+        // By the time it "arrives," the quote it was aimed at is gone.
+        let acks = venue.advance_market(
+            contract(),
+            0.90,
+            100.0,
+            0.95,
+            50.0,
+            Timestamp::from_nanos(1_000_000_000),
+        );
+        assert_eq!(acks.len(), 1);
+        assert!(
+            matches!(acks[0].status, AckStatus::Rejected { .. }),
+            "expected the IOC to be cancelled on arrival, got {:?}",
+            acks[0].status
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_ahead_fraction_reduces_the_liquidity_our_resting_order_can_claim() {
+        let venue = PaperAdapter::with_config(PaperConfig {
+            queue_ahead_fraction: 0.5,
+            latency_ns: 0,
+        });
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.70,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        venue
+            .submit(order(Side::Buy, 0.58, 20.0, OrderType::Limit))
+            .await
+            .unwrap();
+
+        // 30 units of crossing liquidity arrive; half is assumed to be
+        // ahead of us in the real queue, so only 15 are available to us —
+        // less than our full 20-unit order.
+        let fills = venue.advance_market(
+            contract(),
+            0.50,
+            100.0,
+            0.55,
+            30.0,
+            Timestamp::from_nanos(1),
+        );
+        assert_eq!(fills.len(), 1);
+        match &fills[0].status {
+            // advance_market reports each fill event's own quantity as
+            // Filled, regardless of how much of the original order size
+            // it represents — any remainder just keeps resting.
+            AckStatus::Filled { qty, .. } => assert_eq!(*qty, 15.0),
+            other => panic!("expected Filled, got {other:?}"),
+        }
     }
 }

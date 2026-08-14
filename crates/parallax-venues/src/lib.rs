@@ -9,17 +9,23 @@
 //! documentation versus what still needs confirmation before going live.
 
 mod adapter;
+mod http;
 mod kalshi;
 mod paper;
 mod polymarket;
+mod rounding;
+mod symbol_registry;
 
 pub use adapter::VenueAdapter;
+pub use http::{client as http_client, json_or_error, RateLimiter};
 pub use kalshi::{
     parse_orderbook as parse_kalshi_orderbook, KalshiAdapter, KalshiAuthHeaders,
     KalshiRequestSigner, UnconfiguredKalshiSigner,
 };
-pub use paper::PaperAdapter;
+pub use paper::{PaperAdapter, PaperConfig};
 pub use polymarket::{
     parse_book as parse_polymarket_book, PolymarketAdapter, PolymarketOrderSigner,
     PolymarketSignedOrder, UnconfiguredPolymarketSigner,
 };
+pub use rounding::{round_lot, round_price};
+pub use symbol_registry::SymbolRegistry;

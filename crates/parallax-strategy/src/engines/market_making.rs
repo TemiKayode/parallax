@@ -19,6 +19,17 @@ pub struct MarketMakingConfig {
     pub ladder_levels: usize,
     pub level_spacing: f64,
     pub level_size: f64,
+    /// Assumed maker fee rate, applied on both legs of a round trip
+    /// (design doc review 2.1): the quoted half-spread is floored at
+    /// `maker_fee_rate * price * (1 - price)`, the actual round-trip cost
+    /// of a filled quote at that price. A 1-cent half-spread earning 2¢
+    /// gross per round trip against ~3.5¢ of real fees is a strategy that
+    /// loses money faster the better it works; this is not a live
+    /// per-venue lookup (`StrategyInput` deliberately carries no venue
+    /// fee data, matching its "an engine sees its own inventory and the
+    /// book, nothing more" boundary), so keep it in sync with whichever
+    /// venue this engine is actually quoting.
+    pub maker_fee_rate: f64,
 }
 
 impl Default for MarketMakingConfig {
@@ -30,6 +41,8 @@ impl Default for MarketMakingConfig {
             ladder_levels: 3,
             level_spacing: 0.01,
             level_size: 10.0,
+            // Kalshi's published maker rate as of this review.
+            maker_fee_rate: 0.0175,
         }
     }
 }
@@ -67,18 +80,20 @@ impl StrategyEngine for MarketMakingEngine {
                     .calibration
                     .estimate(*a)
                     .fill_probability
-                    .partial_cmp(&input.calibration.estimate(*b).fill_probability)
-                    .unwrap()
+                    .total_cmp(&input.calibration.estimate(*b).fill_probability)
             });
         let Some(venue) = venue else {
             return Vec::new();
         };
 
         let inventory = *input.inventory.get(&venue).unwrap_or(&0.0);
-        let half_spread = self.config.base_half_spread
-            + self.config.band_multiplier * (input.fair_value.band_width() / 2.0);
         let skew = self.config.inventory_skew_sensitivity * inventory;
         let center = (input.fair_value.midpoint - skew).clamp(0.0, 1.0);
+
+        let round_trip_fee_floor = self.config.maker_fee_rate * center * (1.0 - center);
+        let half_spread = (self.config.base_half_spread
+            + self.config.band_multiplier * (input.fair_value.band_width() / 2.0))
+            .max(round_trip_fee_floor);
 
         let mut intents = Vec::new();
         for level in 0..self.config.ladder_levels {
@@ -147,6 +162,7 @@ mod tests {
             band_high: (mid + band_half_width).clamp(0.0, 1.0),
             as_of: Timestamp::from_nanos(0),
             inputs: vec![],
+            effective_sample_size: 1.0,
         }
     }
 
@@ -294,5 +310,40 @@ mod tests {
             .map(|i| i.price)
             .fold(f64::MAX, f64::min);
         (best_bid + best_ask) / 2.0
+    }
+
+    #[test]
+    fn half_spread_is_floored_at_the_round_trip_fee_cost() {
+        // A near-zero base spread and a tight band would otherwise quote
+        // a half-spread far too thin to cover the round-trip fee at a
+        // 50-cent contract (design doc review 2.1).
+        let config = MarketMakingConfig {
+            base_half_spread: 0.0001,
+            band_multiplier: 0.0,
+            maker_fee_rate: 0.0175,
+            ladder_levels: 1,
+            ..MarketMakingConfig::default()
+        };
+        let engine = MarketMakingEngine::new(config);
+        let book = book_quoting(VenueId::Kalshi);
+        let fv = fair_value(0.50, 0.0001);
+        let inventory = HashMap::new();
+        let calibration = Calibrator::default();
+        let input = StrategyInput {
+            contract: &contract(),
+            fair_value: &fv,
+            book: &book,
+            inventory: &inventory,
+            calibration: &calibration,
+            now: Timestamp::from_nanos(0),
+        };
+        let intents = engine.evaluate(&input);
+        let half_spread =
+            (mid_of(&intents) - intents.iter().find(|i| i.side == Side::Buy).unwrap().price).abs();
+        let expected_floor = 0.0175 * 0.50 * 0.50;
+        assert!(
+            half_spread >= expected_floor - 1e-9,
+            "half_spread {half_spread} should be at least the fee floor {expected_floor}"
+        );
     }
 }

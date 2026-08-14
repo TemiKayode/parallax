@@ -26,9 +26,15 @@ pub struct Bus<T> {
 }
 
 impl<T> Bus<T> {
+    /// `ArrayQueue::new(0)` panics outright — a mis-set capacity (an
+    /// empty config, a bad env var parse) would take the process down at
+    /// startup rather than at the moment it's actually exercised. Clamping
+    /// to at least 1 trades "crash on boot" for "publish immediately
+    /// starts dropping," which is observable via `dropped_count()` instead
+    /// of being unrecoverable (design doc review 3.19).
     pub fn new(capacity: usize) -> Self {
         Bus {
-            queue: ArrayQueue::new(capacity),
+            queue: ArrayQueue::new(capacity.max(1)),
             dropped: AtomicU64::new(0),
             published: AtomicU64::new(0),
         }
@@ -78,6 +84,15 @@ impl<T> Bus<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_capacity_is_clamped_instead_of_panicking() {
+        let bus: Bus<u32> = Bus::new(0);
+        assert_eq!(bus.capacity(), 1);
+        assert!(bus.try_publish(1));
+        assert!(!bus.try_publish(2));
+        assert_eq!(bus.dropped_count(), 1);
+    }
 
     #[test]
     fn publish_and_drain_preserve_order() {

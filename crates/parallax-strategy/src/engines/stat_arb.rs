@@ -3,9 +3,10 @@ use parallax_types::{EngineId, OrderIntent, OrderType, Outcome, Side};
 
 #[derive(Debug, Clone, Copy)]
 pub struct StatArbConfig {
-    /// Fraction of the size-implied-by-edge actually taken — a
-    /// conservative multiplier in `(0, 1]` standing in for a full
-    /// fractional-Kelly sizing model (design doc §8).
+    /// Fraction of full Kelly actually taken — quarter-Kelly (0.25) is a
+    /// conventional conservative default, trading long-run growth rate
+    /// for a much smaller drawdown than full Kelly risks on a
+    /// mis-specified edge.
     pub kelly_fraction_cap: f64,
     pub max_order_size: f64,
 }
@@ -21,10 +22,15 @@ impl Default for StatArbConfig {
 
 /// Fires only when a venue's price sits fully outside the fair-value
 /// confidence band (design doc §8) — not merely away from the midpoint.
-/// Position size scales with how far outside the band the price sits,
-/// relative to the band's own width, so a price just barely outside a
-/// tight band and a price wildly outside a wide band can size similarly
-/// per unit of statistical confidence.
+/// Sized by fractional Kelly for a binary contract — `f* = (q−p)/(1−p)`
+/// buying, `f* = (p−q)/p` selling, where `p` is the venue's own price and
+/// `q` is the fair-value midpoint — rather than a formula that happened
+/// to be named for Kelly without deriving from it (design doc review
+/// 2.14). This correctly sizes small near either extreme (being wrong at
+/// 2¢ or 98¢ costs almost nothing *or* almost everything, depending on
+/// which side) and is capped by the venue's own displayed size — asking
+/// for 200 contracts against 5 on offer just rests the other 195 at a
+/// price the model has already called wrong.
 pub struct StatArbEngine {
     config: StatArbConfig,
 }
@@ -34,10 +40,26 @@ impl StatArbEngine {
         StatArbEngine { config }
     }
 
-    fn size_for_edge(&self, edge: f64, band_width: f64) -> f64 {
-        let normalized = edge / band_width.max(1e-6);
-        (self.config.max_order_size * normalized * self.config.kelly_fraction_cap)
-            .clamp(0.0, self.config.max_order_size)
+    /// `market_price` is the venue's own price being transacted against;
+    /// `fair_prob` is the model's fair-value midpoint. Returns a size in
+    /// `[0, max_order_size]`, additionally capped by `displayed_size`.
+    fn kelly_size(
+        &self,
+        side: Side,
+        market_price: f64,
+        fair_prob: f64,
+        displayed_size: f64,
+    ) -> f64 {
+        let p = market_price.clamp(1e-6, 1.0 - 1e-6);
+        let q = fair_prob.clamp(0.0, 1.0);
+        let raw_fraction = match side {
+            Side::Buy => (q - p) / (1.0 - p),
+            Side::Sell => (p - q) / p,
+        };
+        let fraction = (raw_fraction * self.config.kelly_fraction_cap).clamp(0.0, 1.0);
+        (self.config.max_order_size * fraction)
+            .min(displayed_size)
+            .max(0.0)
     }
 }
 
@@ -47,14 +69,17 @@ impl StrategyEngine for StatArbEngine {
     }
 
     fn evaluate(&self, input: &StrategyInput) -> Vec<OrderIntent> {
-        let band_width = input.fair_value.band_width();
         let mut intents = Vec::new();
 
         for tick in input.book.quotes(input.contract) {
             // Cheap: this venue's ask sits below the band -> buy it.
             if tick.ask < input.fair_value.band_low {
-                let edge = input.fair_value.band_low - tick.ask;
-                let size = self.size_for_edge(edge, band_width);
+                let size = self.kelly_size(
+                    Side::Buy,
+                    tick.ask,
+                    input.fair_value.midpoint,
+                    tick.ask_size,
+                );
                 if size > 0.0 {
                     intents.push(OrderIntent {
                         venue: tick.venue,
@@ -71,8 +96,12 @@ impl StrategyEngine for StatArbEngine {
             }
             // Rich: this venue's bid sits above the band -> sell into it.
             if tick.bid > input.fair_value.band_high {
-                let edge = tick.bid - input.fair_value.band_high;
-                let size = self.size_for_edge(edge, band_width);
+                let size = self.kelly_size(
+                    Side::Sell,
+                    tick.bid,
+                    input.fair_value.midpoint,
+                    tick.bid_size,
+                );
                 if size > 0.0 {
                     intents.push(OrderIntent {
                         venue: tick.venue,
@@ -122,6 +151,7 @@ mod tests {
             band_high: 0.69,
             as_of: Timestamp::from_nanos(0),
             inputs: vec![],
+            effective_sample_size: 1.0,
         }
     }
 

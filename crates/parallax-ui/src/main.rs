@@ -14,13 +14,25 @@
 mod dto;
 mod live;
 
-use axum::extract::Json;
+use axum::extract::{DefaultBodyLimit, Json};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::Router;
 use dto::{ArbResponse, BacktestResponse};
 use serde::Deserialize;
+use tower::limit::ConcurrencyLimitLayer;
+
+/// Above this, a request body is rejected outright rather than read into
+/// memory — the arb-detector body is four floats; nothing legitimate
+/// needs more than a few KB (design doc review 3.21).
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+
+/// How many requests may be in flight at once. `/api/backtest` runs a
+/// full synthetic backtest per call — unauthenticated, unbounded
+/// concurrency here is a self-inflicted resource-exhaustion path (design
+/// doc review 3.21).
+const MAX_CONCURRENT_REQUESTS: usize = 16;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const STYLE_CSS: &str = include_str!("../static/style.css");
@@ -84,24 +96,53 @@ async fn live_polymarket_handler() -> Result<Json<live::LiveQuote>, (StatusCode,
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
+async fn health_handler() -> &'static str {
+    "ok"
+}
+
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install Ctrl+C handler");
+    println!("shutdown signal received, draining in-flight requests...");
+}
+
 #[tokio::main]
 async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/style.css", get(style_css))
         .route("/app.js", get(app_js))
+        .route("/health", get(health_handler))
         .route("/api/arb", post(arb_handler))
         .route("/api/backtest", post(backtest_handler))
         .route("/api/live/kalshi", get(live_kalshi_handler))
-        .route("/api/live/polymarket", get(live_polymarket_handler));
+        .route("/api/live/polymarket", get(live_polymarket_handler))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(ConcurrencyLimitLayer::new(MAX_CONCURRENT_REQUESTS));
 
-    let addr = "127.0.0.1:7878";
-    let listener = tokio::net::TcpListener::bind(addr)
+    // Loopback-only by default (design doc review 3.21): every route
+    // here is unauthenticated, and `/api/backtest` runs real work per
+    // request. Binding to all interfaces is an explicit, named opt-in,
+    // never the default a stray env or a copy-pasted deploy config
+    // silently inherits.
+    let allow_remote = std::env::var("PARALLAX_UI_ALLOW_REMOTE").is_ok();
+    let host = if allow_remote { "0.0.0.0" } else { "127.0.0.1" };
+    let addr = format!("{host}:7878");
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .expect("failed to bind to 127.0.0.1:7878");
+        .unwrap_or_else(|e| panic!("failed to bind to {addr}: {e}"));
     println!("PARALLAX dashboard running at http://{addr}");
+    if allow_remote {
+        println!(
+            "PARALLAX_UI_ALLOW_REMOTE is set: listening on all interfaces, not just loopback."
+        );
+    }
     println!("Live venue quotes: real read-only API calls to Kalshi and Polymarket.");
     println!("Backtest/arb-detector panels: synthetic data via the in-memory PaperAdapter.");
     println!("No live order submission anywhere — that stays gated behind an unconfigured signer.");
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
 }

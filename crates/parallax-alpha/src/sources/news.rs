@@ -1,5 +1,8 @@
 use crate::source::AlphaSource;
-use parallax_types::{AlphaEventKind, CanonicalContractId, ProbabilityEstimate, RawEvent};
+use parallax_types::{
+    AlphaEventKind, CanonicalContractId, EstimateKind, ProbabilityEstimate, RawEvent,
+    StalenessPolicy,
+};
 use serde::Deserialize;
 
 /// This source deliberately does NOT implement NLP itself. Headline
@@ -21,10 +24,11 @@ struct NewsPayload {
 pub struct NewsSentimentSource {
     name: String,
     kinds: [AlphaEventKind; 1],
-    /// Max probability displacement from 0.5 at polarity=±1, relevance=1.
+    /// Max log-odds displacement at polarity=±1, relevance=1.
     sensitivity: f64,
     /// Headlines below this relevance are treated as not-about-this-contract.
     min_relevance: f64,
+    correlation_group: Option<String>,
 }
 
 impl NewsSentimentSource {
@@ -32,8 +36,23 @@ impl NewsSentimentSource {
         NewsSentimentSource {
             name: name.into(),
             kinds: [AlphaEventKind::NewsHeadline],
-            sensitivity: 0.30,
+            sensitivity: 2.0,
             min_relevance: 0.15,
+            correlation_group: None,
+        }
+    }
+
+    pub fn with_correlation_group(mut self, group: impl Into<String>) -> Self {
+        self.correlation_group = Some(group.into());
+        self
+    }
+
+    /// Builds from the offline-fitted config artifact (design doc review
+    /// 2.13).
+    pub fn from_config(name: impl Into<String>, config: &crate::config::NewsConfig) -> Self {
+        NewsSentimentSource {
+            sensitivity: config.sensitivity,
+            ..Self::new(name)
         }
     }
 }
@@ -56,21 +75,34 @@ impl AlphaSource for NewsSentimentSource {
             return None;
         }
 
-        let displacement = payload.polarity.clamp(-1.0, 1.0)
+        // A headline is a *directional* signal, not an absolute opinion —
+        // returning `0.5 + polarity*relevance*sensitivity` as an absolute
+        // estimate anchored the pooled probability to 0.5 on every single
+        // headline (of any polarity) and could pull a 0.95 contract
+        // *down* toward 0.8 on bullish news, because the aggregator
+        // treated it as competing evidence about the *level* rather than
+        // a nudge on top of it (design doc review 2.6). A shift in
+        // log-odds space is scale-free: the same headline moves a 0.50
+        // contract a lot and a 0.97 contract very little, applied by the
+        // aggregator on top of the pooled absolute estimate, never voted
+        // into that pool.
+        let shift = payload.polarity.clamp(-1.0, 1.0)
             * payload.relevance.clamp(0.0, 1.0)
             * self.sensitivity;
-        let probability = (0.5 + displacement).clamp(0.0, 1.0);
         // Low relevance means low confidence: std_dev grows as relevance
         // shrinks, floored so a maximally-relevant headline still isn't
         // treated as certain on its own.
-        let std_dev = (0.08 / payload.relevance.max(self.min_relevance)).min(0.5);
+        let std_dev = (0.5 / payload.relevance.max(self.min_relevance)).min(3.0);
 
         Some(ProbabilityEstimate {
             source: self.name.clone(),
             contract: CanonicalContractId(payload.contract),
-            probability,
+            probability: shift,
             std_dev,
             as_of: event.receive_ts,
+            kind: EstimateKind::LogOddsShift,
+            staleness: StalenessPolicy::Decays,
+            correlation_group: self.correlation_group.clone(),
         })
     }
 }
@@ -88,7 +120,7 @@ mod tests {
             publish_ts: None,
             receive_ts: Timestamp::from_nanos(0),
             payload: json!({
-                "contract": "econ.cpi_yoy.us.gt.30.2026-08-13.bls",
+                "contract": "econ.cpi_yoy.us.gt_30.2026-08-13.bls",
                 "polarity": polarity,
                 "relevance": relevance,
             }),
@@ -96,10 +128,25 @@ mod tests {
     }
 
     #[test]
-    fn strongly_relevant_bullish_headline_moves_probability_up() {
+    fn strongly_relevant_bullish_headline_is_a_positive_log_odds_shift() {
         let src = NewsSentimentSource::new("wire-nlp");
         let est = src.on_event(&event(0.9, 0.9)).unwrap();
-        assert!(est.probability > 0.6, "probability was {}", est.probability);
+        assert_eq!(est.kind, EstimateKind::LogOddsShift);
+        assert!(est.probability > 0.0, "shift was {}", est.probability);
+    }
+
+    #[test]
+    fn bearish_headline_is_a_negative_shift() {
+        let src = NewsSentimentSource::new("wire-nlp");
+        let est = src.on_event(&event(-0.9, 0.9)).unwrap();
+        assert!(est.probability < 0.0, "shift was {}", est.probability);
+    }
+
+    #[test]
+    fn zero_polarity_is_a_true_no_op_shift() {
+        let src = NewsSentimentSource::new("wire-nlp");
+        let est = src.on_event(&event(0.0, 0.9)).unwrap();
+        assert!(est.probability.abs() < 1e-9);
     }
 
     #[test]
@@ -114,5 +161,15 @@ mod tests {
         let low = src.on_event(&event(0.5, 0.2)).unwrap();
         let high = src.on_event(&event(0.5, 0.95)).unwrap();
         assert!(low.std_dev > high.std_dev);
+    }
+
+    #[test]
+    fn from_config_uses_the_offline_fitted_sensitivity() {
+        let config = crate::config::NewsConfig { sensitivity: 0.1 };
+        let src = NewsSentimentSource::from_config("wire-nlp", &config);
+        let default_src = NewsSentimentSource::new("wire-nlp");
+        let low_sensitivity = src.on_event(&event(0.9, 0.9)).unwrap();
+        let default_sensitivity = default_src.on_event(&event(0.9, 0.9)).unwrap();
+        assert!(low_sensitivity.probability.abs() < default_sensitivity.probability.abs());
     }
 }

@@ -28,6 +28,15 @@ impl Default for SnipingConfig {
 /// internal decision-path latency (design doc §13) has a direct payoff:
 /// the faster this recompute-to-order path runs, the more of the stale-
 /// quote window gets captured before it updates or someone else takes it.
+///
+/// Requires the fair value to *postdate* the quote it's about to take
+/// (design doc review 3.25): "price outside the band" alone is
+/// indistinguishable from "our model hasn't caught up yet" — a fair
+/// value computed *before* this tick arrived might simply be stale
+/// relative to information the market has already priced in, in which
+/// case PARALLAX is not the sniper here, it is the target. Only a fair
+/// value recomputed at or after the tick's own timestamp counts as
+/// confirmation that the disagreement is real.
 pub struct LiquiditySnipingEngine {
     config: SnipingConfig,
 }
@@ -47,6 +56,11 @@ impl StrategyEngine for LiquiditySnipingEngine {
         let mut intents = Vec::new();
 
         for tick in input.book.quotes(input.contract) {
+            if input.fair_value.as_of.since(tick.receive_ts) < 0 {
+                // Our own information predates this quote — not a
+                // confirmed mispricing, just us being behind.
+                continue;
+            }
             if tick.ask < input.fair_value.band_low
                 && (input.fair_value.band_low - tick.ask) >= self.config.min_edge
             {
@@ -118,6 +132,7 @@ mod tests {
             band_high: 0.69,
             as_of: Timestamp::from_nanos(0),
             inputs: vec![],
+            effective_sample_size: 1.0,
         }
     }
 
@@ -187,5 +202,37 @@ mod tests {
         });
         let intents = run(book);
         assert_eq!(intents[0].size, 5.0);
+    }
+
+    #[test]
+    fn a_fair_value_that_predates_the_quote_does_not_snipe() {
+        // Regression for design doc review 3.25: a mispricing-looking
+        // quote must not be sniped off a fair value that hasn't caught up
+        // to it yet — that's us being behind, not the market being wrong.
+        let mut book = ConsolidatedBook::new();
+        book.update(NormalizedTick {
+            venue: VenueId::Polymarket,
+            contract: contract(),
+            bid: 0.55,
+            bid_size: 20.0,
+            ask: 0.58,
+            ask_size: 42.0,
+            venue_ts: None,
+            receive_ts: Timestamp::from_nanos(1_000_000_000), // tick arrives at t=1s
+        });
+        let inventory = HashMap::new();
+        let calibration = Calibrator::default();
+        let engine = LiquiditySnipingEngine::new(SnipingConfig::default());
+        let mut fv = fair_value_66_pm3();
+        fv.as_of = Timestamp::from_nanos(0); // our view is from before the tick
+        let input = StrategyInput {
+            contract: &contract(),
+            fair_value: &fv,
+            book: &book,
+            inventory: &inventory,
+            calibration: &calibration,
+            now: Timestamp::from_nanos(1_000_000_000),
+        };
+        assert!(engine.evaluate(&input).is_empty());
     }
 }
