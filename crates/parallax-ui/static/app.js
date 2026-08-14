@@ -22,11 +22,17 @@
     card.innerHTML = `<div class="live-card-head"><span class="venue-name">${nameLabel}</span></div><p class="hint">Fetching live quote…</p>`;
     try {
       const res = await fetch(`/api/live/${venue}`);
-      const body = await res.json();
+      // Error responses come back as a plain-text body (the server's
+      // `(StatusCode, String)` error type), not JSON — calling
+      // `res.json()` on those unconditionally throws a confusing
+      // "Unexpected token" parse error instead of showing the real
+      // server-side message. Branch on `res.ok` first and read the
+      // matching body type for each case.
       if (!res.ok) {
-        const message = typeof body === "string" ? body : JSON.stringify(body);
-        throw new Error(message);
+        const message = await res.text();
+        throw new Error(message || `server returned ${res.status}`);
       }
+      const body = await res.json();
       renderLiveQuote(card, nameLabel, body);
     } catch (err) {
       card.innerHTML = `
@@ -108,6 +114,7 @@
       <div class="detail-row"><span>Buy price</span><b>${fmt(arb.buy_price)}</b></div>
       <div class="detail-row"><span>Sell price</span><b>${fmt(arb.sell_price)}</b></div>
       <div class="detail-row"><span>Edge per contract</span><b>${fmt(arb.edge)}</b></div>
+      <div class="detail-row"><span>Executable size</span><b>${fmt(arb.executable_size, 0)}</b></div>
     `;
   }
 
@@ -130,7 +137,22 @@
   });
 
   function renderBacktest(r) {
-    const pnlClass = r.unrealized_pnl >= 0 ? "good" : "bad";
+    if (r.bus_integrity_violated) {
+      // Mirrors BacktestReport::headline() on the Rust side: once a
+      // Critical bus topic has dropped an order ack, the position book
+      // is known-wrong and no PnL number below can be trusted, so don't
+      // show one dressed up as a real result.
+      backtestResult.className = "result-box arb-miss";
+      backtestResult.innerHTML = `
+        <p class="live-error">
+          INTEGRITY VIOLATED: a critical bus topic dropped an order ack during this run —
+          the position book, and therefore every P&amp;L number, cannot be trusted this time.
+          Try running it again.
+        </p>`;
+      return;
+    }
+
+    const netClass = r.net_pnl >= 0 ? "good" : "bad";
     const tiles = [
       ["ticks", r.ticks_processed, ""],
       ["alpha events", r.alpha_events_processed, ""],
@@ -138,7 +160,12 @@
       ["risk-rejected", r.orders_rejected_by_risk, ""],
       ["fills", r.fills, "good"],
       ["filled volume", fmt(r.filled_volume), ""],
-      ["unrealized pnl", fmt(r.unrealized_pnl), pnlClass],
+      ["gross notional", fmt(r.gross_notional_traded), ""],
+      ["realized pnl", fmt(r.realized_pnl), r.realized_pnl >= 0 ? "good" : "bad"],
+      ["unrealized pnl", fmt(r.unrealized_pnl), r.unrealized_pnl >= 0 ? "good" : "bad"],
+      ["fees paid", fmt(r.fees_paid), r.fees_paid > 0 ? "bad" : ""],
+      ["net pnl", fmt(r.net_pnl), netClass],
+      ["max drawdown", fmt(r.max_drawdown), r.max_drawdown > 0 ? "bad" : ""],
     ];
 
     const tileHtml = tiles
@@ -150,6 +177,18 @@
       </div>`
       )
       .join("");
+
+    const rejectionHtml = r.rejection_histogram.length
+      ? `<div class="rejection-list">
+          <p class="subhead">Why orders were rejected by the risk gate</p>
+          ${r.rejection_histogram
+            .map(
+              (rc) => `
+            <div class="detail-row"><span>${escapeHtml(rc.reason)}</span><b>${rc.count}</b></div>`
+            )
+            .join("")}
+        </div>`
+      : "";
 
     const rows = r.open_positions
       .map(
@@ -171,7 +210,7 @@
       : '<p class="hint">No open positions.</p>';
 
     backtestResult.className = "result-box";
-    backtestResult.innerHTML = `<div class="stat-grid">${tileHtml}</div>${positionsHtml}`;
+    backtestResult.innerHTML = `<div class="stat-grid">${tileHtml}</div>${rejectionHtml}${positionsHtml}`;
   }
 
   function escapeHtml(str) {

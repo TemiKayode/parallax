@@ -237,6 +237,21 @@ button:disabled { opacity: 0.6; cursor: wait; }
 .stat-tile .n.bad { color: var(--bad); }
 .stat-tile .l { font-size: 0.66rem; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ink-soft); }
 
+.rejection-list {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem 0.4rem;
+  margin-bottom: 1rem;
+}
+.rejection-list .subhead {
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  margin: 0 0 0.4rem;
+}
+.rejection-list .detail-row { padding: 0.2rem 0; }
+
 table.positions { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
 table.positions th {
   text-align: left;
