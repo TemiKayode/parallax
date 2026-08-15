@@ -44,7 +44,7 @@ pub enum SettlementModel {
 /// wrong as well as its level (design doc review 2.1). A 2-cent crossing
 /// at p≈0.5 costs real fees on both venues even though it looks like
 /// "riskless" gross edge before this is netted out.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct FeeModel {
     pub maker_rate: f64,
     pub taker_rate: f64,

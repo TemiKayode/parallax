@@ -74,6 +74,9 @@ pub struct BacktestResponse {
     /// `gross_pnl - fees_paid` — the number that actually matters.
     pub net_pnl: f64,
     pub max_drawdown: f64,
+    /// Equity after every fill, in order — what the drawdown curve is
+    /// drawn from. Real recorded values, not interpolated or synthesized.
+    pub equity_curve: Vec<f64>,
     /// Set once a Critical bus topic (order acks) has dropped an item
     /// during this run — every PnL number above is then not to be
     /// trusted, and the UI should say so rather than quote them anyway.
@@ -101,6 +104,7 @@ impl From<BacktestReport> for BacktestResponse {
             fees_paid: r.fees_paid,
             net_pnl: r.net_pnl(),
             max_drawdown: r.max_drawdown,
+            equity_curve: r.equity_curve,
             bus_integrity_violated: r.bus_integrity_violated,
             rejection_histogram: r
                 .rejection_histogram

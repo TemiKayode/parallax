@@ -6,6 +6,8 @@
 //! `parallax_cli` library functions, powers `parallax-ui`'s web
 //! dashboard — see that crate for a browser-based view of this.
 
+#![forbid(unsafe_code)]
+
 use parallax_cli::{run_demo_backtest, sample_arb};
 
 fn section(title: &str) {
@@ -16,8 +18,10 @@ fn section(title: &str) {
 async fn main() {
     section("1. Direct cross-venue arbitrage detection (parallax-book)");
     {
-        println!("Polymarket: bid 0.55 / ask 0.60      Kalshi: bid 0.66 / ask 0.70");
-        match sample_arb(0.55, 0.60, 0.66, 0.70) {
+        println!(
+            "Polymarket: bid 0.55 / ask 0.60 (size 40)      Kalshi: bid 0.66 / ask 0.70 (size 30)"
+        );
+        match sample_arb(0.55, 0.60, 40.0, 0.66, 0.70, 30.0) {
             Some(arb) => println!(
                 "  -> arb found: buy {:?} @ {:.2}, sell {:?} @ {:.2}, edge {:.2} per contract (no model required)",
                 arb.buy_venue, arb.buy_price, arb.sell_venue, arb.sell_price, arb.edge
@@ -59,6 +63,9 @@ async fn main() {
             "unrealized PnL (mark-to-model): {:.4}",
             report.unrealized_pnl
         );
+        println!("fees paid:                  {:.4}", report.fees_paid);
+        println!("net PnL (after fees):       {:.4}", report.net_pnl());
+        println!("max drawdown:               {:.4}", report.max_drawdown);
         if report.open_positions.is_empty() {
             println!("open positions:             none");
         } else {

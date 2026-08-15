@@ -5,6 +5,8 @@
 //! cross-venue arbitrage detection (ask on one venue crossing the bid on
 //! another for the *identical* canonical contract, no model required).
 
+#![forbid(unsafe_code)]
+
 use parallax_types::{
     BookDepth, CanonicalContractId, NormalizedTick, Timestamp, VenueId, WalkResult,
 };

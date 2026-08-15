@@ -8,6 +8,8 @@
 //! docs on each adapter for what's been verified against current public
 //! documentation versus what still needs confirmation before going live.
 
+#![forbid(unsafe_code)]
+
 mod adapter;
 mod http;
 mod kalshi;

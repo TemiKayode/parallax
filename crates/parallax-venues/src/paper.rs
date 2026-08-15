@@ -1,7 +1,7 @@
 use crate::adapter::VenueAdapter;
 use async_trait::async_trait;
 use parallax_types::{
-    AckStatus, CanonicalContractId, ExecError, OrderAck, OrderId, OrderIntent, OrderType,
+    AckStatus, CanonicalContractId, ExecError, FeeModel, OrderAck, OrderId, OrderIntent, OrderType,
     SettlementModel, Side, Timestamp, VenueCapabilities, VenueId,
 };
 use std::collections::BTreeMap;
@@ -54,6 +54,17 @@ pub struct PaperConfig {
     /// the exact quote it just reacted to, which no real network round
     /// trip permits.
     pub latency_ns: i64,
+    /// The fee schedule `capabilities()` reports, and every fill in this
+    /// venue's backtests is charged against. `FeeModel::default()` — zero
+    /// maker and taker rates — is the default here for the same reason
+    /// `queue_ahead_fraction`/`latency_ns` default to their most
+    /// flattering values: it keeps `PaperAdapter::new()` a deterministic,
+    /// cost-free matching-engine primitive for unit tests that assert
+    /// exact fill prices/quantities. A caller measuring whether a
+    /// strategy actually has edge must override this explicitly with
+    /// `FeeModel::kalshi_default()`/`polymarket_default()` — a zero fee
+    /// model silently reports an idealization, not a result.
+    pub fee_model: FeeModel,
 }
 
 impl Default for PaperConfig {
@@ -61,6 +72,7 @@ impl Default for PaperConfig {
         PaperConfig {
             queue_ahead_fraction: 0.0,
             latency_ns: 0,
+            fee_model: FeeModel::default(),
         }
     }
 }
@@ -239,7 +251,15 @@ impl PaperAdapter {
 
         let mut acks = Vec::new();
         for id in ready_ids {
-            let (tracked, _arrival) = state.pending.remove(&id).unwrap();
+            // `ready_ids` was just collected from `state.pending` above,
+            // and nothing between that collection and this removal can
+            // mutate `state.pending` — the whole `advance_market` call
+            // holds `self.state`'s lock for its entire duration, so no
+            // concurrent submit()/cancel() can race this loop.
+            let (tracked, _arrival) = state
+                .pending
+                .remove(&id)
+                .expect("id was just read from state.pending under the same lock");
             let (filled_qty, fill_price) =
                 Self::try_immediate_match(Some(&market), &tracked.intent);
             let rest_remainder = matches!(tracked.intent.order_type, OrderType::Limit);
@@ -384,11 +404,7 @@ impl VenueAdapter for PaperAdapter {
             settlement: SettlementModel::Simulated,
             min_tick: 0.01,
             min_order_size: 1.0,
-            fee_model: parallax_types::FeeModel {
-                maker_rate: 0.0,
-                taker_rate: 0.0,
-                round_up_to: 0.0,
-            },
+            fee_model: self.config.fee_model,
             rate_limit_per_sec: u32::MAX,
         }
     }
@@ -805,6 +821,7 @@ mod tests {
         let venue = PaperAdapter::with_config(PaperConfig {
             queue_ahead_fraction: 0.0,
             latency_ns: 1_000_000_000, // 1s
+            ..PaperConfig::default()
         });
         venue.advance_market(
             contract(),
@@ -854,6 +871,7 @@ mod tests {
         let venue = PaperAdapter::with_config(PaperConfig {
             queue_ahead_fraction: 0.5,
             latency_ns: 0,
+            ..PaperConfig::default()
         });
         venue.advance_market(
             contract(),

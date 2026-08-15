@@ -17,6 +17,11 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "A cross-venue, event-driven statistical arbitrage engine for prediction markets (Kalshi, Polymarket) — risk-gated market making, stat-arb, and liquidity-sniping strategies in Rust."
+repository = "https://github.com/TemiKayode/parallax"
+readme = "README.md"
+keywords = ["trading", "arbitrage", "prediction-markets", "kalshi", "polymarket"]
+categories = ["finance", "simulation"]
 
 [workspace.dependencies]
 parallax-types = { path = "crates/parallax-types" }

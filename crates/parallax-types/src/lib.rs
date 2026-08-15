@@ -4,6 +4,8 @@
 //! everything here is plain data so it can cross the hot-path ring buffer
 //! by value and be replayed byte-identically in the sim harness.
 
+#![forbid(unsafe_code)]
+
 mod alpha;
 mod contract;
 mod market;

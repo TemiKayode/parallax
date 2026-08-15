@@ -3,6 +3,7 @@ name = "parallax-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
 
 [[bin]]
 name = "parallax-ui"
@@ -17,4 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }
 axum = "0.7"
-tower = { version = "0.4", features = ["limit"] }
+tower = { version = "0.4", features = ["limit", "timeout", "util"] }

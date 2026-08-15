@@ -12,6 +12,8 @@
 //! bug. A rising drop count is a capacity/consumer-speed problem to fix
 //! upstream, not something to paper over here.
 
+#![forbid(unsafe_code)]
+
 mod topics;
 
 pub use topics::PipelineBus;

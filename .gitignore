@@ -3,20 +3,43 @@
 
 # Python
 offline/.venv/
+**/.venv/
+**/venv/
 offline/__pycache__/
 **/__pycache__/
 *.pyc
 .ipynb_checkpoints/
+.pytest_cache/
 
-# Local secrets / credentials — never commit venue API keys
+# Local secrets / credentials — never commit venue API keys, signing keys,
+# or wallet material. Kalshi trading keys and Polymarket/EIP-712 wallet
+# keys are exactly what parallax-venues' Unconfigured*Signer types exist
+# to keep out of the codebase; this backstops that at the file level.
 .env
 *.env
 secrets.toml
 **/credentials.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_rsa.pub
+id_ed25519*
+wallet.json
 
-# OS
+# Editors / OS
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
 
 # Local sandbox snapshot artifacts — not part of the source tree
 _parallax_src.tgz

@@ -8,6 +8,8 @@
 //! principle named in the relevant design doc, not a copy of any
 //! reference project's code.
 
+#![forbid(unsafe_code)]
+
 mod aggregator;
 pub mod config;
 mod forecast_quality;

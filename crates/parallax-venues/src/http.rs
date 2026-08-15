@@ -20,6 +20,13 @@ pub fn client() -> reqwest::Client {
         .connect_timeout(Duration::from_secs(5))
         .pool_idle_timeout(Duration::from_secs(30))
         .build()
+        // `build()` only fails on TLS-backend initialization failure — an
+        // environment-level misconfiguration (missing root certs, a
+        // broken rustls install) that would make every venue call fail
+        // anyway. Threading a `Result` through every adapter constructor
+        // to handle a case that means "this process cannot make HTTPS
+        // requests at all" buys nothing; fail loudly at construction
+        // instead of quietly on the first live call.
         .expect("failed to build HTTP client")
 }
 

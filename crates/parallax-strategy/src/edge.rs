@@ -93,7 +93,7 @@ pub fn largest_profitable_size(ctx: &EdgeContext, candidate_sizes: &[f64]) -> Op
         .iter()
         .filter_map(|&size| compute_tradable_edge(ctx, size))
         .filter(|r| r.tradable_edge > 0.0)
-        .max_by(|a, b| a.size.partial_cmp(&b.size).unwrap())
+        .max_by(|a, b| a.size.total_cmp(&b.size))
 }
 
 #[cfg(test)]

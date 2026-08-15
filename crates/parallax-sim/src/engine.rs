@@ -8,7 +8,7 @@ use parallax_types::{
     AckStatus, CanonicalContractId, ClusterKey, OrderId, OrderIntent, ProbabilityEstimate,
     Timestamp,
 };
-use parallax_venues::{PaperAdapter, VenueAdapter};
+use parallax_venues::{PaperAdapter, PaperConfig, VenueAdapter};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -37,8 +37,18 @@ pub struct Backtest {
 }
 
 impl Backtest {
+    /// `venue_config` is not optional because it is not safe to default:
+    /// `PaperConfig::default()` is zero-fee/zero-latency/front-of-queue —
+    /// the most flattering matching engine a backtest can run against, and
+    /// exactly right for a unit test asserting exact fill mechanics, but
+    /// silently wrong for anyone reading the resulting P&L as evidence a
+    /// strategy has edge. Pass `PaperConfig { fee_model:
+    /// FeeModel::kalshi_default()` (or `polymarket_default()`), .. }`
+    /// explicitly for anything meant to measure a strategy rather than
+    /// exercise the pipeline (see `docs/GOING-LIVE.md`, Stage 0).
     pub fn new(
         risk_limits: RiskLimits,
+        venue_config: PaperConfig,
         alpha_sources: Vec<Box<dyn AlphaSource>>,
         engines: Vec<Box<dyn StrategyEngine + Send + Sync>>,
     ) -> Self {
@@ -50,7 +60,7 @@ impl Backtest {
             risk: RiskGate::new_presumed_flat(risk_limits),
             strategy: StrategyCore::new(engines),
             calibrator: Calibrator::default(),
-            venue: Arc::new(PaperAdapter::new()),
+            venue: Arc::new(PaperAdapter::with_config(venue_config)),
             alpha_sources,
             aggregator_config: AggregatorConfig::default(),
             estimates: HashMap::new(),
@@ -361,6 +371,7 @@ mod tests {
     async fn stale_cheap_quote_after_bullish_weather_update_gets_bought_and_reported() {
         let mut backtest = Backtest::new(
             RiskLimits::default(),
+            PaperConfig::default(),
             vec![Box::new(WeatherEnsembleSource::new("hrrr"))],
             vec![
                 Box::new(LiquiditySnipingEngine::new(SnipingConfig::default())),

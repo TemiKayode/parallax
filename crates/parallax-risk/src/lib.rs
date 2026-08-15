@@ -3,6 +3,8 @@
 //! logically-linked contracts share one exposure budget, and independent
 //! kill switches at the global/venue/contract scope.
 
+#![forbid(unsafe_code)]
+
 mod gate;
 mod kill_switch;
 
@@ -473,7 +475,7 @@ mod tests {
     fn global_kill_switch_rejects_everything() {
         let contract = spec(869).to_id();
         let mut gate = RiskGate::new_presumed_flat(RiskLimits::default());
-        gate.kill_switch_mut().trip_global("feed dropout");
+        gate.trip_global("feed dropout");
         let book = book_with_tick(VenueId::Kalshi, contract.clone(), 0);
         let ord = intent(VenueId::Kalshi, contract, Side::Buy, 1.0);
         match gate.check(&ord, &book, Timestamp::from_nanos(0)) {
@@ -536,8 +538,7 @@ mod tests {
     fn venue_kill_switch_does_not_affect_other_venues() {
         let contract = spec(869).to_id();
         let mut gate = RiskGate::new_presumed_flat(RiskLimits::default());
-        gate.kill_switch_mut()
-            .trip_venue(VenueId::Polymarket, "error rate spike");
+        gate.trip_venue(VenueId::Polymarket, "error rate spike");
 
         let book_kalshi = book_with_tick(VenueId::Kalshi, contract.clone(), 0);
         let ord_kalshi = intent(VenueId::Kalshi, contract.clone(), Side::Buy, 1.0);
@@ -550,5 +551,19 @@ mod tests {
         assert!(gate
             .check(&ord_poly, &book_poly, Timestamp::from_nanos(0))
             .is_err());
+    }
+
+    #[test]
+    fn operator_reset_clears_a_trip_that_check_would_otherwise_still_see() {
+        let contract = spec(869).to_id();
+        let mut gate = RiskGate::new_presumed_flat(RiskLimits::default());
+        let book = book_with_tick(VenueId::Kalshi, contract.clone(), 0);
+        let ord = intent(VenueId::Kalshi, contract, Side::Buy, 1.0);
+
+        gate.trip_global("test fault");
+        assert!(gate.check(&ord, &book, Timestamp::from_nanos(0)).is_err());
+
+        gate.operator_reset_kill_switches();
+        assert!(gate.check(&ord, &book, Timestamp::from_nanos(0)).is_ok());
     }
 }

@@ -3,6 +3,7 @@ name = "parallax-bus"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
 
 [dependencies]
 parallax-types.workspace = true

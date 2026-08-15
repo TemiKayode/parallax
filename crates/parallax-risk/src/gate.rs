@@ -215,12 +215,37 @@ impl RiskGate {
         Ok(())
     }
 
-    pub fn kill_switch_mut(&mut self) -> &mut KillSwitch {
-        &mut self.kill_switch
-    }
-
     pub fn kill_switch(&self) -> &KillSwitch {
         &self.kill_switch
+    }
+
+    /// Trips the global kill switch — every venue, every contract. Safe to
+    /// call broadly: anything that detects a session-wide fault (a feed
+    /// outage, an unexplained reconciliation mismatch) should be able to
+    /// trip this without needing special authority.
+    pub fn trip_global(&mut self, reason: impl Into<String>) {
+        self.kill_switch.trip_global(reason);
+    }
+
+    pub fn trip_venue(&mut self, venue: VenueId, reason: impl Into<String>) {
+        self.kill_switch.trip_venue(venue, reason);
+    }
+
+    pub fn trip_contract(&mut self, contract: CanonicalContractId, reason: impl Into<String>) {
+        self.kill_switch.trip_contract(contract, reason);
+    }
+
+    /// Clears every tripped kill switch. Deliberately not named
+    /// `reset` or exposed via a general mutable accessor: unlike tripping
+    /// (which anything detecting a fault should be able to do), resetting
+    /// is the one kill-switch operation that must never happen as a side
+    /// effect of routine code — a switch that resets itself re-enters the
+    /// condition that tripped it. This exists for an operator to call
+    /// explicitly, after confirming out of band that whatever tripped it
+    /// is actually resolved, and it is never called from anywhere in the
+    /// trading path in this codebase.
+    pub fn operator_reset_kill_switches(&mut self) {
+        self.kill_switch.reset_all();
     }
 
     /// Ingestion/normalization calls this once per newly-seen canonical

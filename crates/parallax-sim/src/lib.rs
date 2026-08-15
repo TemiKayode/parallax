@@ -6,6 +6,8 @@
 //! is the only thing that changes to go from backtest to live — that's
 //! the payoff of the trait boundaries built into every other crate.
 
+#![forbid(unsafe_code)]
+
 mod engine;
 mod replay;
 mod report;

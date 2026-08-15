@@ -4,6 +4,8 @@
 //! lightweight online calibration layer (§11), and the `StrategyCore`
 //! that runs them in priority order ahead of the risk gate's batch check.
 
+#![forbid(unsafe_code)]
+
 mod calibration;
 mod core;
 mod edge;
