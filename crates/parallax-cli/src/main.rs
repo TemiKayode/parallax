@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use parallax_cli::{run_demo_backtest, sample_arb};
+use parallax_cli::{run_demo_backtest, run_edge_distribution, sample_arb};
 
 fn section(title: &str) {
     println!("\n=== {title} ===");
@@ -76,6 +76,41 @@ async fn main() {
                     contract.0
                 );
             }
+        }
+    }
+
+    section("3. Edge distribution across seeds (parallax-sim, docs/GOING-LIVE.md Stage 0)");
+    {
+        const N_SEEDS: u64 = 200;
+        println!("Same scenario, {N_SEEDS} seeds — each perturbs the ensemble forecast, both");
+        println!("venues' quoted prices, and queue position within realistic bounds (execution");
+        println!("latency is deliberately not perturbed here; see edge_distribution.rs for why).");
+        println!("A single run only proves the pipeline wires together; this is a p10, not a point estimate.");
+        let dist = run_edge_distribution(N_SEEDS).await;
+        println!("\n--- edge distribution report ---");
+        println!("runs:                       {}", dist.len());
+        if !dist.excluded_seeds.is_empty() {
+            println!(
+                "excluded (integrity violated): {}  {:?}",
+                dist.excluded_seeds.len(),
+                dist.excluded_seeds
+            );
+        }
+        println!(
+            "profitable:                 {}/{}",
+            dist.profitable_count(),
+            dist.len()
+        );
+        println!("mean net PnL:                {:.4}", dist.mean());
+        println!("median net PnL (p50):        {:.4}", dist.median());
+        println!("p10 net PnL:                 {:.4}", dist.percentile(10.0));
+        println!("p90 net PnL:                 {:.4}", dist.percentile(90.0));
+        if dist.percentile(10.0) <= 0.0 {
+            println!(
+                "\np10 is not positive — per docs/GOING-LIVE.md, this strategy's edge is not yet"
+            );
+            println!("demonstrated. This is still synthetic data with perturbed synthetic noise,");
+            println!("not the recorded real venue book data Stage 0 ultimately calls for.");
         }
     }
 

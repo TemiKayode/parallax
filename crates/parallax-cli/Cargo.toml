@@ -19,3 +19,5 @@ parallax-sim.workspace = true
 parallax-venues.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+rand.workspace = true
+rand_pcg.workspace = true

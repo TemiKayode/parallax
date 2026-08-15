@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+mod edge_distribution;
+
+pub use edge_distribution::{run_edge_distribution, run_seeded_scenario, EdgeDistributionReport};
+
 use parallax_alpha::WeatherEnsembleSource;
 use parallax_book::{ConsolidatedBook, CrossVenueArb};
 use parallax_risk::RiskLimits;
