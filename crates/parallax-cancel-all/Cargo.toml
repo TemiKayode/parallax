@@ -1,0 +1,18 @@
+[package]
+name = "parallax-cancel-all"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "parallax-cancel-all"
+path = "src/main.rs"
+
+[dependencies]
+parallax-types.workspace = true
+parallax-venues.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+async-trait = "0.1"

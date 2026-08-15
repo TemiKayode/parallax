@@ -178,6 +178,9 @@ mod tests {
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExecError> {
             Ok(Vec::new())
         }
+        async fn list_open_orders(&self) -> Result<Vec<OrderId>, ExecError> {
+            Ok(Vec::new())
+        }
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod deadman;
 mod execution;
 mod http;
 mod journal;
@@ -21,6 +22,7 @@ mod rounding;
 mod symbol_registry;
 
 pub use adapter::VenueAdapter;
+pub use deadman::{run_heartbeat_loop, DeadmanSwitch};
 pub use execution::{submit_idempotent, SubmitOutcome};
 pub use http::{client as http_client, json_or_error, RateLimiter};
 pub use journal::{recover_unresolved, JournalEntry, OrderJournal};

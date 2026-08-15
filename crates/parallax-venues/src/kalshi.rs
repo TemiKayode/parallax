@@ -77,8 +77,12 @@ impl KalshiAdapter {
             signer,
             symbols,
             // Published limit is higher; this self-throttles well below it
-            // rather than skating against it (design doc review 3.4).
-            rate_limiter: RateLimiter::new(8),
+            // rather than skating against it (design doc review 3.4). 2 of
+            // the 8 tokens/sec are held back for cancel requests
+            // specifically — docs/GOING-LIVE.md Stage 2: running out of
+            // cancel capacity while holding live quotes during a fault is
+            // the worst reachable state.
+            rate_limiter: RateLimiter::with_reserved_for_cancel(8, 2),
         }
     }
 
@@ -303,7 +307,10 @@ impl VenueAdapter for KalshiAdapter {
     /// (design doc review 3.5).
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError> {
         let path = format!("/portfolio/orders/{}", order_id.0);
-        self.rate_limiter.acquire().await;
+        // Not `acquire()`: a cancel is exactly the request the reserved
+        // tokens exist for, and it must never queue behind ordinary
+        // traffic that has already exhausted the shared budget.
+        self.rate_limiter.acquire_for_cancel().await;
         let timestamp_ms = Timestamp::now().as_nanos() / 1_000_000;
         let _headers = self
             .signer
@@ -338,6 +345,19 @@ impl VenueAdapter for KalshiAdapter {
         Err(ExecError::Connection {
             venue: VenueId::Kalshi,
             message: "position fetch is not yet implemented for Kalshi — verify GET /portfolio/positions against docs.kalshi.com before wiring into live reconciliation".into(),
+        })
+    }
+
+    /// Not yet wired to a live call — same reasoning as
+    /// `find_order_by_client_id` above, for `GET /portfolio/orders?status=open`.
+    /// This is the one an out-of-band cancel-all tool needs most, and it
+    /// stays refused for the same reason: guessing at the query shape for
+    /// a script whose entire purpose is emergency order cancellation is
+    /// exactly backwards.
+    async fn list_open_orders(&self) -> Result<Vec<OrderId>, ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Kalshi,
+            message: "open-order listing is not yet implemented for Kalshi — verify GET /portfolio/orders against docs.kalshi.com before wiring into live reconciliation or cancel-all".into(),
         })
     }
 }

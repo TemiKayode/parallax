@@ -35,9 +35,19 @@ pub fn client() -> reqwest::Client {
 /// should acquire a permit before sending, staying below the venue's
 /// published limit rather than skating against it and finding out from a
 /// 429.
+///
+/// `reserved_for_cancel` tokens are held back from ordinary traffic
+/// (`acquire`) and spendable only through `acquire_for_cancel`
+/// (docs/GOING-LIVE.md Stage 2: "hold back enough tokens to cancel every
+/// resting order at all times" — running out of cancel capacity while
+/// holding live quotes during a fault is the worst reachable state, and
+/// it's preventable by exactly this arithmetic). `RateLimiter::new`
+/// reserves nothing, matching its existing behavior; call
+/// `with_reserved_for_cancel` to opt in.
 pub struct RateLimiter {
     capacity: f64,
     refill_per_sec: f64,
+    reserved_for_cancel: f64,
     state: Mutex<RateLimiterState>,
 }
 
@@ -48,10 +58,18 @@ struct RateLimiterState {
 
 impl RateLimiter {
     pub fn new(requests_per_sec: u32) -> Self {
+        Self::with_reserved_for_cancel(requests_per_sec, 0)
+    }
+
+    pub fn with_reserved_for_cancel(requests_per_sec: u32, reserved_for_cancel: u32) -> Self {
         let capacity = (requests_per_sec.max(1)) as f64;
+        // Reserving more than the whole bucket would starve ordinary
+        // traffic completely — clamped, not trusted.
+        let reserved_for_cancel = (reserved_for_cancel as f64).min(capacity);
         RateLimiter {
             capacity,
             refill_per_sec: capacity,
+            reserved_for_cancel,
             state: Mutex::new(RateLimiterState {
                 tokens: capacity,
                 last_refill: Instant::now(),
@@ -61,8 +79,23 @@ impl RateLimiter {
 
     /// Waits, if necessary, until a request is allowed, then consumes one
     /// token. Never returns early just because another caller is also
-    /// waiting — each call independently earns its own token.
+    /// waiting — each call independently earns its own token. Will not
+    /// spend the last `reserved_for_cancel` tokens — use
+    /// `acquire_for_cancel` for a cancel request.
     pub async fn acquire(&self) {
+        self.acquire_above_floor(self.reserved_for_cancel).await;
+    }
+
+    /// Same as `acquire`, but may spend all the way down to zero,
+    /// including the tokens `acquire` refuses to touch. The only caller
+    /// that should ever reach for this is an actual cancel request — a
+    /// reserve that ordinary traffic can also dip into on a good excuse
+    /// isn't a reserve.
+    pub async fn acquire_for_cancel(&self) {
+        self.acquire_above_floor(0.0).await;
+    }
+
+    async fn acquire_above_floor(&self, floor: f64) {
         loop {
             let wait = {
                 let mut state = self.state.lock().await;
@@ -72,11 +105,12 @@ impl RateLimiter {
                     .as_secs_f64();
                 state.tokens = (state.tokens + elapsed * self.refill_per_sec).min(self.capacity);
                 state.last_refill = now;
-                if state.tokens >= 1.0 {
+                let available = state.tokens - floor;
+                if available >= 1.0 {
                     state.tokens -= 1.0;
                     None
                 } else {
-                    let deficit = 1.0 - state.tokens;
+                    let deficit = 1.0 - available;
                     Some(Duration::from_secs_f64(
                         (deficit / self.refill_per_sec).max(0.0),
                     ))
@@ -105,6 +139,21 @@ fn classify_status(
             .map(|secs| secs * 1000)
             .unwrap_or(1_000);
         return Some(ExecError::RateLimited {
+            venue,
+            retry_after_ms,
+        });
+    }
+    if status.as_u16() == 425 {
+        // Distinct from the generic `!is_success()` fallback below on
+        // purpose (docs/GOING-LIVE.md Stage 2) — folding this into
+        // `Rejected` loses the signal that aggressive immediate retry is
+        // exactly the wrong response to a matching engine that's still
+        // coming back up.
+        let retry_after_ms = retry_after
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| secs * 1000)
+            .unwrap_or(5_000);
+        return Some(ExecError::VenueRestarting {
             venue,
             retry_after_ms,
         });
@@ -188,6 +237,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn http_425_is_a_distinct_venue_restarting_error_not_a_generic_rejection() {
+        let status = reqwest::StatusCode::from_u16(425).unwrap();
+        match classify_status(VenueId::Polymarket, status, Some("10")) {
+            Some(ExecError::VenueRestarting { retry_after_ms, .. }) => {
+                assert_eq!(retry_after_ms, 10_000)
+            }
+            other => panic!("expected VenueRestarting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_425_without_a_header_still_gets_a_conservative_default() {
+        let status = reqwest::StatusCode::from_u16(425).unwrap();
+        match classify_status(VenueId::Polymarket, status, None) {
+            Some(ExecError::VenueRestarting { retry_after_ms, .. }) => {
+                assert!(retry_after_ms > 0)
+            }
+            other => panic!("expected VenueRestarting, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn rate_limiter_throttles_bursts_above_capacity() {
         let limiter = RateLimiter::new(1_000); // generous, just proving it doesn't hang
@@ -207,5 +278,41 @@ mod tests {
         }
         // Burst of 2 is free; the 3rd must wait for a refill.
         assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn ordinary_traffic_cannot_spend_the_reserved_cancel_tokens() {
+        // 3/sec, 1 reserved for cancel: ordinary acquire() can only ever
+        // draw down to 1 token remaining, never below it.
+        let limiter = RateLimiter::with_reserved_for_cancel(3, 1);
+        let start = Instant::now();
+        limiter.acquire().await;
+        limiter.acquire().await;
+        // The 2 non-reserved tokens are spent; a 3rd ordinary acquire()
+        // must wait for a refill rather than eating the reserve.
+        limiter.acquire().await;
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn acquire_for_cancel_can_spend_the_reserve_immediately() {
+        let limiter = RateLimiter::with_reserved_for_cancel(3, 1);
+        limiter.acquire().await;
+        limiter.acquire().await;
+        // Ordinary traffic has now exhausted everything but the reserve.
+        // A cancel must still go through without waiting.
+        let start = Instant::now();
+        limiter.acquire_for_cancel().await;
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn reserving_more_than_capacity_is_clamped_not_trusted() {
+        // Asking to reserve 100 out of a 3-token bucket must not starve
+        // every ordinary request forever — it's clamped to the capacity.
+        let limiter = RateLimiter::with_reserved_for_cancel(3, 100);
+        let start = Instant::now();
+        limiter.acquire_for_cancel().await;
+        assert!(start.elapsed() < Duration::from_millis(50));
     }
 }

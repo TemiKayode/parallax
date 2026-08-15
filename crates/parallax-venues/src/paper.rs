@@ -539,6 +539,21 @@ impl VenueAdapter for PaperAdapter {
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExecError> {
         Ok(Vec::new())
     }
+
+    /// Every order still live on this venue: resting (crossed the book,
+    /// waiting for a match) and pending (submitted but not yet "arrived"
+    /// under a nonzero `PaperConfig::latency_ns`) both count as
+    /// currently-working — either would need to be canceled by an
+    /// out-of-band cancel-all (docs/GOING-LIVE.md Stage 2).
+    async fn list_open_orders(&self) -> Result<Vec<OrderId>, ExecError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state
+            .resting
+            .keys()
+            .chain(state.pending.keys())
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1027,5 +1042,78 @@ mod tests {
     async fn a_paper_venue_reports_no_positions_by_design() {
         let venue = PaperAdapter::new();
         assert_eq!(venue.fetch_positions().await.unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_includes_a_resting_limit_but_not_a_completed_ioc() {
+        let venue = PaperAdapter::new();
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+
+        // Fully fills immediately — nothing left open.
+        venue
+            .submit(order(Side::Buy, 0.65, 20.0, OrderType::ImmediateOrCancel))
+            .await
+            .unwrap();
+
+        // Doesn't cross — rests on the book.
+        let resting_ack = venue
+            .submit(order(Side::Buy, 0.58, 15.0, OrderType::Limit))
+            .await
+            .unwrap();
+
+        let open = venue.list_open_orders().await.unwrap();
+        assert_eq!(open, vec![resting_ack.order_id]);
+    }
+
+    #[tokio::test]
+    async fn list_open_orders_includes_a_still_pending_order_under_latency() {
+        let venue = PaperAdapter::with_config(PaperConfig {
+            latency_ns: 1_000_000,
+            ..PaperConfig::default()
+        });
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        let ack = venue
+            .submit(order(Side::Buy, 0.65, 20.0, OrderType::ImmediateOrCancel))
+            .await
+            .unwrap();
+        assert_eq!(ack.status, AckStatus::Accepted);
+
+        let open = venue.list_open_orders().await.unwrap();
+        assert_eq!(open, vec![ack.order_id]);
+    }
+
+    #[tokio::test]
+    async fn a_canceled_order_no_longer_appears_in_list_open_orders() {
+        let venue = PaperAdapter::new();
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        let ack = venue
+            .submit(order(Side::Buy, 0.58, 15.0, OrderType::Limit))
+            .await
+            .unwrap();
+        assert_eq!(venue.list_open_orders().await.unwrap().len(), 1);
+
+        venue.cancel(ack.order_id).await.unwrap();
+        assert!(venue.list_open_orders().await.unwrap().is_empty());
     }
 }

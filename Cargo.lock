@@ -573,6 +573,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "parallax-cancel-all"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parallax-types",
+ "parallax-venues",
+ "tokio",
+]
+
+[[package]]
 name = "parallax-cli"
 version = "0.1.0"
 dependencies = [

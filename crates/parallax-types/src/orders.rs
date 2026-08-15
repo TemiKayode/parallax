@@ -133,6 +133,17 @@ pub enum ExecError {
     Rejected { venue: VenueId, reason: String },
     #[error("rate limited by venue {venue}, retry after {retry_after_ms}ms")]
     RateLimited { venue: VenueId, retry_after_ms: u64 },
+    /// HTTP 425 ("Too Early") — the venue's matching engine is mid-restart
+    /// and not yet accepting normal orders (docs/GOING-LIVE.md Stage 2:
+    /// "Polymarket returns HTTP 425 during matching-engine restarts and
+    /// then runs post-only for two minutes"). Distinct from `Rejected`
+    /// deliberately: code that folds this into a generic rejection and
+    /// retries aggressively hammers a recovering engine and gets
+    /// rate-limited exactly when it wants back in. `retry_after_ms` is a
+    /// floor, not a guarantee the venue is fully back to normal — the
+    /// post-only window the doc describes can outlast it.
+    #[error("venue {venue} is restarting (HTTP 425), retry after {retry_after_ms}ms")]
+    VenueRestarting { venue: VenueId, retry_after_ms: u64 },
     #[error("venue {venue} connection error: {message}")]
     Connection { venue: VenueId, message: String },
     #[error("order {0} not found")]
@@ -273,6 +284,11 @@ mod tests {
         }
         .is_safely_retryable());
         assert!(ExecError::RateLimited {
+            venue: VenueId::Kalshi,
+            retry_after_ms: 100
+        }
+        .is_safely_retryable());
+        assert!(ExecError::VenueRestarting {
             venue: VenueId::Kalshi,
             retry_after_ms: 100
         }

@@ -10,6 +10,7 @@ members = [
     "crates/parallax-venues",
     "crates/parallax-sim",
     "crates/parallax-cli",
+    "crates/parallax-cancel-all",
     "crates/parallax-ui",
 ]
 

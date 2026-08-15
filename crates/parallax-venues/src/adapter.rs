@@ -41,4 +41,12 @@ pub trait VenueAdapter: Send + Sync {
     /// `docs/GOING-LIVE.md` Stage 1: "the venue is always right. Never
     /// trade until local state and venue state agree."
     async fn fetch_positions(&self) -> Result<Vec<Position>, ExecError>;
+
+    /// The venue's own view of every currently-working (resting,
+    /// unfilled) order on this account. `docs/GOING-LIVE.md` Stage 1 asks
+    /// for this at the same three points as `fetch_positions` ("fetch
+    /// positions *and* working orders"); Stage 2's out-of-band cancel
+    /// path is the other consumer — you cannot cancel-all without first
+    /// knowing what's open.
+    async fn list_open_orders(&self) -> Result<Vec<OrderId>, ExecError>;
 }

@@ -71,7 +71,11 @@ impl PolymarketAdapter {
             gamma_base_url: "https://gamma-api.polymarket.com".to_string(),
             signer,
             symbols,
-            rate_limiter: RateLimiter::new(8),
+            // 2 of the 8 tokens/sec are held back for cancel requests
+            // specifically — docs/GOING-LIVE.md Stage 2: running out of
+            // cancel capacity while holding live quotes during a fault is
+            // the worst reachable state.
+            rate_limiter: RateLimiter::with_reserved_for_cancel(8, 2),
         }
     }
 
@@ -273,7 +277,10 @@ impl VenueAdapter for PolymarketAdapter {
     /// (design doc review 3.5): a market maker that cannot cancel
     /// accumulates resting ladders it can never retract.
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError> {
-        self.rate_limiter.acquire().await;
+        // Not `acquire()`: a cancel is exactly the request the reserved
+        // tokens exist for, and it must never queue behind ordinary
+        // traffic that has already exhausted the shared budget.
+        self.rate_limiter.acquire_for_cancel().await;
         let cancel_json = serde_json::json!({ "orderID": order_id.0 });
         let _signed =
             self.signer
@@ -307,6 +314,35 @@ impl VenueAdapter for PolymarketAdapter {
         Err(ExecError::Connection {
             venue: VenueId::Polymarket,
             message: "position fetch is not yet implemented for Polymarket — verify against the Data API's positions endpoint before wiring into live reconciliation".into(),
+        })
+    }
+
+    /// Not yet wired to a live call — same reasoning as
+    /// `find_order_by_client_id` above. This is the one an out-of-band
+    /// cancel-all tool needs most, and it stays refused for the same
+    /// reason: guessing at the query shape for a script whose entire
+    /// purpose is emergency order cancellation is exactly backwards.
+    async fn list_open_orders(&self) -> Result<Vec<OrderId>, ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Polymarket,
+            message: "open-order listing is not yet implemented for Polymarket — verify against the CLOB open-orders endpoint before wiring into live reconciliation or cancel-all".into(),
+        })
+    }
+}
+
+/// docs/GOING-LIVE.md Stage 2: "Polymarket's CLOB has a heartbeat
+/// endpoint... wire it before your first live order, not after." Not yet
+/// wired to a live call, for the same reason every other query method on
+/// this adapter isn't: the heartbeat endpoint's exact shape and required
+/// interval need verifying against current CLOB documentation before
+/// this is safe to depend on — the highest-value safety control in
+/// Stage 2 is also the last one that should ship unverified.
+#[async_trait]
+impl crate::deadman::DeadmanSwitch for PolymarketAdapter {
+    async fn heartbeat(&self) -> Result<(), ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Polymarket,
+            message: "the CLOB heartbeat/dead-man-switch endpoint is not yet implemented — verify its shape and required interval against current CLOB documentation before wiring this in live".into(),
         })
     }
 }

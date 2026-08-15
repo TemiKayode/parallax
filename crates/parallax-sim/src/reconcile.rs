@@ -30,6 +30,11 @@ use std::path::Path;
 pub struct ReconciliationReport {
     /// Positions loaded into the risk gate from the venue's own report.
     pub positions_loaded: usize,
+    /// Currently-working orders the venue reports as open right now —
+    /// visibility for an operator (or an out-of-band cancel-all) into
+    /// what's actually live, independent of anything this process's own
+    /// memory or journal believes.
+    pub open_orders: Vec<parallax_types::OrderId>,
     /// Journaled orders whose true state the venue confirmed — either it
     /// has the order (already reflected in the position fetch below) or
     /// it confirmed no record of it (safely dropped, nothing to do).
@@ -91,6 +96,7 @@ pub async fn reconcile_startup(
     if !orders_unresolved.is_empty() {
         return Ok(ReconciliationReport {
             positions_loaded: 0,
+            open_orders: Vec::new(),
             orders_resolved,
             orders_unresolved,
             gate_reconciled: false,
@@ -102,8 +108,25 @@ pub async fn reconcile_startup(
         Err(e) => {
             return Ok(ReconciliationReport {
                 positions_loaded: 0,
+                open_orders: Vec::new(),
                 orders_resolved,
                 orders_unresolved: vec![(ClientOrderId("(position fetch)".into()), e.to_string())],
+                gate_reconciled: false,
+            });
+        }
+    };
+
+    let open_orders = match venue.list_open_orders().await {
+        Ok(open_orders) => open_orders,
+        Err(e) => {
+            return Ok(ReconciliationReport {
+                positions_loaded: 0,
+                open_orders: Vec::new(),
+                orders_resolved,
+                orders_unresolved: vec![(
+                    ClientOrderId("(open-order listing)".into()),
+                    e.to_string(),
+                )],
                 gate_reconciled: false,
             });
         }
@@ -123,6 +146,7 @@ pub async fn reconcile_startup(
 
     Ok(ReconciliationReport {
         positions_loaded,
+        open_orders,
         orders_resolved,
         orders_unresolved: Vec::new(),
         gate_reconciled: true,
@@ -168,12 +192,13 @@ mod tests {
         p
     }
 
-    /// A controllable double: scripted lookup/position results, no real
-    /// submit path needed for these tests.
+    /// A controllable double: scripted lookup/position/open-order
+    /// results, no real submit path needed for these tests.
     #[derive(Default)]
     struct FakeVenue {
         lookup_results: Mutex<Vec<Result<Option<OrderAck>, ExecError>>>,
         positions: Mutex<Option<Result<Vec<Position>, ExecError>>>,
+        open_orders: Mutex<Option<Result<Vec<OrderId>, ExecError>>>,
     }
 
     #[async_trait]
@@ -205,6 +230,13 @@ mod tests {
         }
         async fn fetch_positions(&self) -> Result<Vec<Position>, ExecError> {
             self.positions
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Ok(Vec::new()))
+        }
+        async fn list_open_orders(&self) -> Result<Vec<OrderId>, ExecError> {
+            self.open_orders
                 .lock()
                 .unwrap()
                 .take()
@@ -250,6 +282,7 @@ mod tests {
         let venue = FakeVenue {
             lookup_results: Mutex::new(vec![Ok(None)]),
             positions: Mutex::new(Some(Ok(Vec::new()))),
+            ..Default::default()
         };
         let mut gate = RiskGate::new(RiskLimits::default());
 
@@ -276,6 +309,7 @@ mod tests {
                 message: "timed out".into(),
             })]),
             positions: Mutex::new(Some(Ok(Vec::new()))),
+            ..Default::default()
         };
         let mut gate = RiskGate::new(RiskLimits::default());
 
@@ -313,5 +347,44 @@ mod tests {
 
         assert!(!report.gate_reconciled);
         assert!(!gate.is_reconciled());
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_order_listing_also_blocks_reconciliation() {
+        let path = temp_journal_path("open_orders_failed.jsonl");
+        std::fs::remove_file(&path).ok();
+        let venue = FakeVenue {
+            positions: Mutex::new(Some(Ok(Vec::new()))),
+            open_orders: Mutex::new(Some(Err(ExecError::Connection {
+                venue: VenueId::Kalshi,
+                message: "500".into(),
+            }))),
+            ..Default::default()
+        };
+        let mut gate = RiskGate::new(RiskLimits::default());
+
+        let report = reconcile_startup(&venue, &mut gate, &path).await.unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(!report.gate_reconciled);
+        assert!(!gate.is_reconciled());
+    }
+
+    #[tokio::test]
+    async fn a_successful_reconciliation_surfaces_the_venues_open_orders() {
+        let path = temp_journal_path("open_orders_ok.jsonl");
+        std::fs::remove_file(&path).ok();
+        let venue = FakeVenue {
+            positions: Mutex::new(Some(Ok(Vec::new()))),
+            open_orders: Mutex::new(Some(Ok(vec![OrderId("resting-1".into())]))),
+            ..Default::default()
+        };
+        let mut gate = RiskGate::new(RiskLimits::default());
+
+        let report = reconcile_startup(&venue, &mut gate, &path).await.unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(report.gate_reconciled);
+        assert_eq!(report.open_orders, vec![OrderId("resting-1".into())]);
     }
 }
