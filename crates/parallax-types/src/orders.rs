@@ -119,7 +119,7 @@ pub enum AckStatus {
     Canceled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderAck {
     pub order_id: OrderId,
     pub venue: VenueId,

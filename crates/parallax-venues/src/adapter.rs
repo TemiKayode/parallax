@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use parallax_types::{ExecError, OrderAck, OrderId, OrderIntent, VenueCapabilities, VenueId};
+use parallax_types::{
+    ClientOrderId, ExecError, OrderAck, OrderId, OrderIntent, Position, VenueCapabilities, VenueId,
+};
 
 /// The plugin boundary every venue implements (design doc §9/§17). New
 /// venues are added by implementing this trait — nothing upstream (the
@@ -18,4 +20,25 @@ pub trait VenueAdapter: Send + Sync {
     fn capabilities(&self) -> VenueCapabilities;
     async fn submit(&self, order: OrderIntent) -> Result<OrderAck, ExecError>;
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError>;
+
+    /// Looks up an order's last known status at the venue by the
+    /// deterministic id `ClientOrderId::derive` computes for the intent
+    /// that produced it. `Ok(None)` means the venue has no record of this
+    /// order at all — the specific, narrow condition
+    /// `docs/GOING-LIVE.md` Stage 1 requires before a timed-out submit is
+    /// safe to resend: "before any retry, query order state by client
+    /// ID; only resend if the venue has no record." See
+    /// `execution::submit_idempotent`, the only caller that should ever
+    /// use this to decide whether to retry.
+    async fn find_order_by_client_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<OrderAck>, ExecError>;
+
+    /// The venue's own view of every open position on this account — the
+    /// ground truth `reconcile::reconcile_startup` loads into the risk
+    /// gate before it will approve a single order.
+    /// `docs/GOING-LIVE.md` Stage 1: "the venue is always right. Never
+    /// trade until local state and venue state agree."
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ExecError>;
 }

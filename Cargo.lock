@@ -601,6 +601,7 @@ dependencies = [
 name = "parallax-sim"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "parallax-alpha",
  "parallax-book",
  "parallax-risk",

@@ -1,10 +1,10 @@
 use crate::adapter::VenueAdapter;
 use async_trait::async_trait;
 use parallax_types::{
-    AckStatus, CanonicalContractId, ExecError, FeeModel, OrderAck, OrderId, OrderIntent, OrderType,
-    SettlementModel, Side, Timestamp, VenueCapabilities, VenueId,
+    AckStatus, CanonicalContractId, ClientOrderId, ExecError, FeeModel, OrderAck, OrderId,
+    OrderIntent, OrderType, Position, SettlementModel, Side, Timestamp, VenueCapabilities, VenueId,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -34,6 +34,17 @@ struct PaperState {
     /// arrival time (design doc review 4.6).
     pending: BTreeMap<OrderId, (Tracked, i64)>,
     market: BTreeMap<CanonicalContractId, MarketState>,
+    /// Every ack this venue has ever produced, keyed by the deterministic
+    /// id `ClientOrderId::derive` computes from the order that produced
+    /// it — overwritten with an order's latest status as it moves through
+    /// Accepted -> PartiallyFilled -> Filled, so a lookup always returns
+    /// the most recent known state. What `find_order_by_client_id`
+    /// answers from (docs/GOING-LIVE.md Stage 1's idempotent-retry rule:
+    /// "before any retry, query order state by client ID"). A `HashMap`,
+    /// not a `BTreeMap` like the maps above — this one is never iterated
+    /// in a way whose order matters, only looked up by key, so there's no
+    /// determinism requirement to buy a `BTreeMap`'s ordering for.
+    by_client_id: HashMap<ClientOrderId, OrderAck>,
 }
 
 /// Models the two most flattering assumptions a paper venue can make
@@ -105,6 +116,7 @@ impl PaperAdapter {
                 resting: BTreeMap::new(),
                 pending: BTreeMap::new(),
                 market: BTreeMap::new(),
+                by_client_id: HashMap::new(),
             }),
             next_id: AtomicU64::new(1),
             next_sequence: AtomicU64::new(1),
@@ -275,6 +287,9 @@ impl PaperAdapter {
                 t.intent.size = remaining_qty;
                 state.resting.insert(id, t);
             }
+            state
+                .by_client_id
+                .insert(ClientOrderId::derive(&tracked.intent), ack.clone());
             acks.push(ack);
         }
         acks
@@ -370,7 +385,7 @@ impl PaperAdapter {
             } else {
                 state.resting.remove(&id);
             }
-            acks.push(OrderAck {
+            let ack = OrderAck {
                 order_id: id,
                 venue: VenueId::Paper,
                 status: AckStatus::Filled {
@@ -378,7 +393,11 @@ impl PaperAdapter {
                     price: fill_price,
                 },
                 ts: now,
-            });
+            };
+            state
+                .by_client_id
+                .insert(ClientOrderId::derive(intent), ack.clone());
+            acks.push(ack);
         }
 
         state.market.insert(contract, market);
@@ -436,12 +455,16 @@ impl VenueAdapter for PaperAdapter {
                     arrival,
                 ),
             );
-            return Ok(OrderAck {
+            let ack = OrderAck {
                 order_id,
                 venue: VenueId::Paper,
                 status: AckStatus::Accepted,
                 ts: order.created_at,
-            });
+            };
+            state
+                .by_client_id
+                .insert(ClientOrderId::derive(&order), ack.clone());
+            return Ok(ack);
         }
 
         let market = state.market.get(&order.contract).copied();
@@ -461,11 +484,11 @@ impl VenueAdapter for PaperAdapter {
             }
         }
 
-        match order.order_type {
+        let ack = match order.order_type {
             OrderType::ImmediateOrCancel => {
                 let (ack, _, _) =
                     Self::ack_for_immediate_result(order_id, &order, filled_qty, fill_price, false);
-                Ok(ack)
+                ack
             }
             OrderType::Limit => {
                 let (ack, to_rest, remaining) = Self::ack_for_immediate_result(
@@ -480,9 +503,13 @@ impl VenueAdapter for PaperAdapter {
                     t.intent.size = remaining_qty;
                     state.resting.insert(order_id, t);
                 }
-                Ok(ack)
+                ack
             }
-        }
+        };
+        state
+            .by_client_id
+            .insert(ClientOrderId::derive(&order), ack.clone());
+        Ok(ack)
     }
 
     async fn cancel(&self, order_id: OrderId) -> Result<(), ExecError> {
@@ -492,6 +519,25 @@ impl VenueAdapter for PaperAdapter {
         } else {
             Err(ExecError::NotFound(order_id))
         }
+    }
+
+    async fn find_order_by_client_id(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Result<Option<OrderAck>, ExecError> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.by_client_id.get(client_order_id).cloned())
+    }
+
+    /// A paper matching engine isn't an account with a ledger, and
+    /// intentionally doesn't keep one — `RiskGate`'s own position map,
+    /// built from every ack this adapter has ever produced, is already
+    /// the single source of truth for a backtest's positions. Returning
+    /// an empty list here (rather than reconstructing a second, parallel
+    /// position ledger that could drift from the first) is the honest
+    /// answer, not an unimplemented stub.
+    async fn fetch_positions(&self) -> Result<Vec<Position>, ExecError> {
+        Ok(Vec::new())
     }
 }
 
@@ -905,5 +951,81 @@ mod tests {
             AckStatus::Filled { qty, .. } => assert_eq!(*qty, 15.0),
             other => panic!("expected Filled, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn find_order_by_client_id_has_no_record_of_an_order_never_submitted() {
+        let venue = PaperAdapter::new();
+        let never_submitted = order(Side::Buy, 0.5, 10.0, OrderType::ImmediateOrCancel);
+        let id = parallax_types::ClientOrderId::derive(&never_submitted);
+        assert_eq!(venue.find_order_by_client_id(&id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn find_order_by_client_id_returns_the_ack_from_an_immediate_fill() {
+        let venue = PaperAdapter::new();
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        let intent = order(Side::Buy, 0.65, 20.0, OrderType::ImmediateOrCancel);
+        let id = parallax_types::ClientOrderId::derive(&intent);
+        let submitted_ack = venue.submit(intent).await.unwrap();
+
+        let found = venue.find_order_by_client_id(&id).await.unwrap();
+        assert_eq!(found, Some(submitted_ack));
+    }
+
+    #[tokio::test]
+    async fn find_order_by_client_id_reflects_a_pending_orders_latest_status_not_its_first() {
+        // A latency-delayed order is Accepted (into `pending`) on submit,
+        // then resolved later by `activate_pending`. A retry orchestrator
+        // querying by client id after the resolution must see the *final*
+        // status, not the stale Accepted snapshot from submission time.
+        let venue = PaperAdapter::with_config(PaperConfig {
+            latency_ns: 1_000_000,
+            ..PaperConfig::default()
+        });
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(0),
+        );
+        let intent = order(Side::Buy, 0.65, 20.0, OrderType::ImmediateOrCancel);
+        let id = parallax_types::ClientOrderId::derive(&intent);
+
+        let submit_ack = venue.submit(intent).await.unwrap();
+        assert_eq!(submit_ack.status, AckStatus::Accepted);
+        assert_eq!(
+            venue.find_order_by_client_id(&id).await.unwrap(),
+            Some(submit_ack)
+        );
+
+        // The order's 1ms latency has now elapsed; this tick resolves it.
+        venue.advance_market(
+            contract(),
+            0.60,
+            100.0,
+            0.63,
+            100.0,
+            Timestamp::from_nanos(2_000_000),
+        );
+        match venue.find_order_by_client_id(&id).await.unwrap() {
+            Some(ack) => assert!(matches!(ack.status, AckStatus::Filled { .. })),
+            None => panic!("expected the resolved fill's ack, found no record"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paper_venue_reports_no_positions_by_design() {
+        let venue = PaperAdapter::new();
+        assert_eq!(venue.fetch_positions().await.unwrap(), Vec::new());
     }
 }

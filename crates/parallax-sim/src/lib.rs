@@ -9,9 +9,11 @@
 #![forbid(unsafe_code)]
 
 mod engine;
+mod reconcile;
 mod replay;
 mod report;
 
 pub use engine::Backtest;
+pub use reconcile::{reconcile_startup, ReconciliationReport};
 pub use replay::{load_jsonl, parse_jsonl, ReplayEvent};
 pub use report::BacktestReport;

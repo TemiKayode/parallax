@@ -314,6 +314,32 @@ impl VenueAdapter for KalshiAdapter {
             })?;
         Err(ExecError::NotFound(order_id))
     }
+
+    /// Not yet wired to a live call, for the same reason `submit` isn't:
+    /// the query shape (`GET /portfolio/orders?client_order_id=...`, per
+    /// public documentation) hasn't been exercised against a live
+    /// endpoint. Refusing loudly here is the correct behavior for
+    /// `execution::submit_idempotent` — it must never treat "we don't
+    /// know" as "the venue has no record," which is the one condition
+    /// that licenses a resend.
+    async fn find_order_by_client_id(
+        &self,
+        _client_order_id: &parallax_types::ClientOrderId,
+    ) -> Result<Option<OrderAck>, ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Kalshi,
+            message: "order lookup by client_order_id is not yet implemented for Kalshi — verify GET /portfolio/orders against docs.kalshi.com before wiring into live idempotent retry".into(),
+        })
+    }
+
+    /// Not yet wired to a live call — same reasoning as
+    /// `find_order_by_client_id` above, for `GET /portfolio/positions`.
+    async fn fetch_positions(&self) -> Result<Vec<parallax_types::Position>, ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Kalshi,
+            message: "position fetch is not yet implemented for Kalshi — verify GET /portfolio/positions against docs.kalshi.com before wiring into live reconciliation".into(),
+        })
+    }
 }
 
 #[cfg(test)]

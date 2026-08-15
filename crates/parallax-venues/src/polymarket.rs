@@ -284,6 +284,31 @@ impl VenueAdapter for PolymarketAdapter {
                 })?;
         Err(ExecError::NotFound(order_id))
     }
+
+    /// Not yet wired to a live call, for the same reason `submit` isn't:
+    /// the query shape hasn't been exercised against a live CLOB
+    /// endpoint. Refusing loudly here is the correct behavior for
+    /// `execution::submit_idempotent` — it must never treat "we don't
+    /// know" as "the venue has no record," which is the one condition
+    /// that licenses a resend.
+    async fn find_order_by_client_id(
+        &self,
+        _client_order_id: &parallax_types::ClientOrderId,
+    ) -> Result<Option<OrderAck>, ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Polymarket,
+            message: "order lookup by client_order_id is not yet implemented for Polymarket — verify against the CLOB order-status endpoint before wiring into live idempotent retry".into(),
+        })
+    }
+
+    /// Not yet wired to a live call — same reasoning as
+    /// `find_order_by_client_id` above.
+    async fn fetch_positions(&self) -> Result<Vec<parallax_types::Position>, ExecError> {
+        Err(ExecError::Connection {
+            venue: VenueId::Polymarket,
+            message: "position fetch is not yet implemented for Polymarket — verify against the Data API's positions endpoint before wiring into live reconciliation".into(),
+        })
+    }
 }
 
 #[cfg(test)]

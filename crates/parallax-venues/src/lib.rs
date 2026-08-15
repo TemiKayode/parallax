@@ -11,7 +11,9 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod execution;
 mod http;
+mod journal;
 mod kalshi;
 mod paper;
 mod polymarket;
@@ -19,7 +21,9 @@ mod rounding;
 mod symbol_registry;
 
 pub use adapter::VenueAdapter;
+pub use execution::{submit_idempotent, SubmitOutcome};
 pub use http::{client as http_client, json_or_error, RateLimiter};
+pub use journal::{recover_unresolved, JournalEntry, OrderJournal};
 pub use kalshi::{
     parse_orderbook as parse_kalshi_orderbook, KalshiAdapter, KalshiAuthHeaders,
     KalshiRequestSigner, UnconfiguredKalshiSigner,
