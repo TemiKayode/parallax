@@ -8,12 +8,19 @@
 
 #![forbid(unsafe_code)]
 
+mod alerting;
 mod engine;
+mod fee_verification;
 mod reconcile;
 mod replay;
 mod report;
 
+pub use alerting::{
+    check_feed_data_quality, check_feed_staleness, check_reconciliation, check_rejection_rate,
+    Alert,
+};
 pub use engine::Backtest;
+pub use fee_verification::{FeeCheckOutcome, FeeVerifier};
 pub use reconcile::{reconcile_startup, ReconciliationReport};
 pub use replay::{load_jsonl, parse_jsonl, ReplayEvent};
 pub use report::BacktestReport;

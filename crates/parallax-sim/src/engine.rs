@@ -90,10 +90,14 @@ impl Backtest {
         let contract = tick.contract.clone();
         let now = tick.receive_ts;
         self.book.update(tick.clone());
-        if self.book.rejected_ticks() > 0 {
-            // Surfaced via the report; a rising count means the feed
-            // shape changed (design doc review 1.1/GO_LIVE §2).
-        }
+        // A rising `rejected_ticks()` means the feed's shape changed —
+        // malformed data that used to parse, or a source that started
+        // sending invalid records (design doc review 1.1). This used to
+        // be an empty `if` with a comment claiming the count was
+        // "surfaced via the report" when nothing did; it's actually
+        // surfaced now, by `alerting::check_feed_data_quality(&self.book)`
+        // — docs/GOING-LIVE.md Stage 3 — which a caller runs against the
+        // book after a replay/backtest completes.
 
         let fills = self.venue.advance_market(
             contract.clone(),
@@ -172,8 +176,36 @@ impl Backtest {
         let results = self.risk.check_batch(&proposals, &self.book, now);
         for (intent, result) in proposals.into_iter().zip(results) {
             match result {
-                Err(reason) => self.report.record_rejection(reject_reason_label(&reason)),
+                Err(reason) => {
+                    // docs/GOING-LIVE.md Stage 3: "Rule 5 fired because
+                    // the pair cost 96.2 cents is a debuggable sentence
+                    // at 3am; a fill with no recorded reason is an
+                    // argument." `reason`'s Debug output carries every
+                    // field the specific rule rejected on (the touch
+                    // price, the projected notional, whichever limit —
+                    // see RejectReason), not just its variant name.
+                    tracing::info!(
+                        engine = ?intent.engine,
+                        venue = ?intent.venue,
+                        contract = %intent.contract.0,
+                        side = ?intent.side,
+                        price = intent.price,
+                        size = intent.size,
+                        reason = ?reason,
+                        "order rejected by risk gate"
+                    );
+                    self.report.record_rejection(reject_reason_label(&reason));
+                }
                 Ok(()) => {
+                    tracing::debug!(
+                        engine = ?intent.engine,
+                        venue = ?intent.venue,
+                        contract = %intent.contract.0,
+                        side = ?intent.side,
+                        price = intent.price,
+                        size = intent.size,
+                        "order accepted by risk gate"
+                    );
                     // Reserved immediately, before submission — a working
                     // order is real exposure the instant it's live, and
                     // the next proposal in this same batch must see it

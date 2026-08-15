@@ -16,6 +16,28 @@ fn section(title: &str) {
 
 #[tokio::main]
 async fn main() {
+    // docs/GOING-LIVE.md Stage 3: "log every decision with the rule that
+    // fired." parallax-sim emits a tracing event per risk-gate decision
+    // (accept at debug, reject — with the specific RejectReason — at
+    // info); this subscriber is what makes them visible. Quiet by
+    // default: a real deployment would send these to a persistent log at
+    // info level always-on, but this demo runs the edge-distribution
+    // check across 200 seeds every time, and unfiltered that's hundreds
+    // of interleaved rejection events burying the curated report below.
+    // Opt in with RUST_LOG=parallax_sim=info (rejections) or
+    // parallax_sim=debug (every decision, accepted or not).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("parallax_sim=warn")),
+        )
+        .init();
+    println!(
+        "(Stage 3 decision logging is wired but quiet by default here — set \
+         RUST_LOG=parallax_sim=info to see the risk gate's rejections, or \
+         parallax_sim=debug for every decision, accepted or not.)"
+    );
+
     section("1. Direct cross-venue arbitrage detection (parallax-book)");
     {
         println!(

@@ -25,7 +25,9 @@ pub use adapter::VenueAdapter;
 pub use deadman::{run_heartbeat_loop, DeadmanSwitch};
 pub use execution::{submit_idempotent, SubmitOutcome};
 pub use http::{client as http_client, json_or_error, RateLimiter};
-pub use journal::{recover_unresolved, JournalEntry, OrderJournal};
+pub use journal::{
+    export_fill_ledger, recover_unresolved, write_ledger_csv, JournalEntry, LedgerRow, OrderJournal,
+};
 pub use kalshi::{
     parse_orderbook as parse_kalshi_orderbook, KalshiAdapter, KalshiAuthHeaders,
     KalshiRequestSigner, UnconfiguredKalshiSigner,
