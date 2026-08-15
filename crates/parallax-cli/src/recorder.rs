@@ -152,19 +152,27 @@ pub fn append_tick_jsonl(file: &mut File, tick: &NormalizedTick) -> std::io::Res
 /// failed fetch is reported, not fatal — over a recording session run
 /// for hours or days, a transient rate limit or a momentarily empty book
 /// on one venue must not stop the other venue's recording, or the whole
-/// session.
+/// session. Returns the actual tick on success, not just `()` — a
+/// caller feeding these into a live `ConsolidatedBook` (`docs/GOING-LIVE.md`
+/// Stage 4) needs it, not just a record that *something* was appended.
 pub struct RecordAttempt {
-    pub kalshi: Result<(), String>,
-    pub polymarket: Result<(), String>,
+    pub kalshi: Result<NormalizedTick, String>,
+    pub polymarket: Result<NormalizedTick, String>,
 }
 
 pub async fn record_once(file: &mut File) -> RecordAttempt {
     let kalshi = match fetch_kalshi_tick().await {
-        Ok(tick) => append_tick_jsonl(file, &tick).map_err(|e| e.to_string()),
+        Ok(tick) => match append_tick_jsonl(file, &tick) {
+            Ok(()) => Ok(tick),
+            Err(e) => Err(e.to_string()),
+        },
         Err(e) => Err(e),
     };
     let polymarket = match fetch_polymarket_tick().await {
-        Ok(tick) => append_tick_jsonl(file, &tick).map_err(|e| e.to_string()),
+        Ok(tick) => match append_tick_jsonl(file, &tick) {
+            Ok(()) => Ok(tick),
+            Err(e) => Err(e.to_string()),
+        },
         Err(e) => Err(e),
     };
     RecordAttempt { kalshi, polymarket }
