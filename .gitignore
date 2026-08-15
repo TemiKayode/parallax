@@ -43,3 +43,8 @@ Thumbs.db
 
 # Local sandbox snapshot artifacts — not part of the source tree
 _parallax_src.tgz
+
+# parallax-record's default output (docs/GOING-LIVE.md, Stage 0) — a
+# local data recording, not source; can grow large and shouldn't be
+# committed wholesale.
+/recordings/

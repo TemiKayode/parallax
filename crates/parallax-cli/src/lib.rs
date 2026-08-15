@@ -7,8 +7,12 @@
 #![forbid(unsafe_code)]
 
 mod edge_distribution;
+mod recorder;
 
 pub use edge_distribution::{run_edge_distribution, run_seeded_scenario, EdgeDistributionReport};
+pub use recorder::{
+    append_tick_jsonl, fetch_kalshi_tick, fetch_polymarket_tick, record_once, RecordAttempt,
+};
 
 use parallax_alpha::WeatherEnsembleSource;
 use parallax_book::{ConsolidatedBook, CrossVenueArb};
