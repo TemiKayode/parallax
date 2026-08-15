@@ -1,17 +1,27 @@
 //! Stage 0 of `docs/GOING-LIVE.md`: "report the distribution, not a
-//! number... run many seeds... judge on the 10th percentile." A single
-//! deterministic backtest (`run_demo_backtest`) proves the pipeline wires
-//! together; it cannot prove a strategy has edge, because one draw of
-//! forecast/quote noise is not evidence about the distribution those
-//! numbers are drawn from.
+//! number... run many seeds and many time periods... judge on the 10th
+//! percentile." A single deterministic backtest (`run_demo_backtest`)
+//! proves the pipeline wires together; it cannot prove a strategy has
+//! edge, because one draw of forecast/quote noise, in one market regime,
+//! is not evidence about the distribution those numbers are drawn from.
 //!
 //! This runs the same weather-update → stale-quote → fill scenario many
-//! times, perturbing per seed exactly the things a real deployment cannot
-//! pin down in advance — the ensemble forecast, both venues' quoted
-//! prices, and queue position — and reports the resulting P&L
+//! times, perturbing per seed exactly the things a real deployment
+//! cannot pin down in advance — the ensemble forecast, both venues'
+//! quoted prices, and queue position — and reports the resulting P&L
 //! distribution rather than one number. It is still synthetic data, not
 //! the recorded venue book data Stage 0 ultimately calls for; see the
 //! module-level caveat on `run_edge_distribution`.
+//!
+//! [`Regime`] is the "many time periods" half of that sentence: the
+//! doc's own gate is explicit that a positive p10 in one market
+//! condition isn't enough — "across periods that include at least one
+//! volatility shock and one quiet week." `run_multi_regime_distribution`
+//! runs the identical seeded-perturbation methodology against three
+//! distinct base scenarios (a confident baseline, a wider/faster
+//! volatility-shock variant, and a low-signal quiet-period variant) and
+//! reports whether p10 clears zero in *every* one of them — the gate,
+//! checked, not just described.
 //!
 //! Deliberately not perturbed: execution latency. `PaperAdapter` only
 //! resolves a latency-delayed order on the *next* `advance_market` call
@@ -43,14 +53,77 @@ use parallax_venues::PaperConfig;
 use rand::{Rng, SeedableRng};
 use rand_pcg::Pcg64;
 
-/// Bounds every perturbation stays within — wide enough to be a real
-/// stress on the scenario, narrow enough that the qualitative shape of
-/// "confident bullish ensemble, stale cheap Polymarket quote" survives
-/// every draw. A jitter that could flip the ensemble's direction or
-/// invert a quote's bid/ask would stop testing this strategy and start
-/// testing a different, unrelated scenario.
-const ENSEMBLE_JITTER_TENTHS: i32 = 15; // +/- 1.5 degF per member
-const QUOTE_JITTER: f64 = 0.02; // +/- 2c on each side of each quoted book
+/// A distinct market condition the same seeded-perturbation methodology
+/// is run against — the doc's "many time periods," made concrete instead
+/// of left as one scenario perturbed by noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Regime {
+    /// The original demo scenario: a confident, unanimous bullish
+    /// ensemble against a Polymarket quote that hasn't caught up yet.
+    Baseline,
+    /// A bigger, faster, more chaotic move than baseline: wider ensemble
+    /// *disagreement* even as the mean forecast moves further past the
+    /// threshold, and wider, further-repriced quotes on both venues.
+    /// What this regime is actually for is stress-testing the risk
+    /// gate's collar and notional limits under a bigger shock — not just
+    /// checking the strategy stays profitable when the edge is even more
+    /// obvious.
+    VolatilityShock,
+    /// A low-signal day: the ensemble sits close to the threshold (a
+    /// real but weak, uncertain direction) and both venues already agree
+    /// closely with each other. Little to no riskless mispricing exists
+    /// to take — this is the realistic common case a strategy has to not
+    /// lose money on, not the dramatic day baseline models.
+    QuietPeriod,
+}
+
+impl Regime {
+    fn base_ensemble_tenths(self) -> [i32; 5] {
+        match self {
+            Regime::Baseline => [920, 930, 915, 925, 918],
+            Regime::VolatilityShock => [960, 890, 945, 875, 930],
+            Regime::QuietPeriod => [875, 880, 870, 878, 872],
+        }
+    }
+
+    fn base_stale_quote(self) -> (f64, f64) {
+        match self {
+            Regime::Baseline => (0.50, 0.55),
+            Regime::VolatilityShock => (0.40, 0.62),
+            Regime::QuietPeriod => (0.56, 0.59),
+        }
+    }
+
+    fn base_kalshi_quote(self) -> (f64, f64) {
+        match self {
+            Regime::Baseline => (0.90, 0.94),
+            Regime::VolatilityShock => (0.93, 0.99),
+            Regime::QuietPeriod => (0.57, 0.60),
+        }
+    }
+
+    /// +/- tenths of a degree F applied independently to each ensemble
+    /// member — wider in a volatility-shock regime (more day-to-day
+    /// forecast noise in a chaotic period), tighter but still real in a
+    /// quiet one.
+    fn ensemble_jitter_tenths(self) -> i32 {
+        match self {
+            Regime::Baseline => 15,
+            Regime::VolatilityShock => 30,
+            Regime::QuietPeriod => 8,
+        }
+    }
+
+    /// +/- price jitter applied independently to each quoted bid/ask.
+    fn quote_jitter(self) -> f64 {
+        match self {
+            Regime::Baseline => 0.02,
+            Regime::VolatilityShock => 0.05,
+            Regime::QuietPeriod => 0.01,
+        }
+    }
+}
+
 const MAX_QUEUE_AHEAD_FRACTION: f64 = 0.5;
 
 struct ScenarioDraw {
@@ -62,9 +135,9 @@ struct ScenarioDraw {
     queue_ahead_fraction: f64,
 }
 
-fn jitter_quote(rng: &mut impl Rng, base_bid: f64, base_ask: f64) -> (f64, f64) {
-    let bid = (base_bid + rng.gen_range(-QUOTE_JITTER..=QUOTE_JITTER)).clamp(0.01, 0.98);
-    let ask = (base_ask + rng.gen_range(-QUOTE_JITTER..=QUOTE_JITTER)).clamp(0.02, 0.99);
+fn jitter_quote(rng: &mut impl Rng, jitter: f64, base_bid: f64, base_ask: f64) -> (f64, f64) {
+    let bid = (base_bid + rng.gen_range(-jitter..=jitter)).clamp(0.01, 0.98);
+    let ask = (base_ask + rng.gen_range(-jitter..=jitter)).clamp(0.02, 0.99);
     // A crossed book (ask <= bid) isn't a smaller edge, it's not a book —
     // nudging the ask up preserves "some spread exists" without silently
     // discarding the draw (which would bias the sample toward whichever
@@ -76,15 +149,19 @@ fn jitter_quote(rng: &mut impl Rng, base_bid: f64, base_ask: f64) -> (f64, f64) 
     }
 }
 
-fn draw_scenario(rng: &mut impl Rng) -> ScenarioDraw {
-    let base = [920, 930, 915, 925, 918];
+fn draw_scenario(regime: Regime, rng: &mut impl Rng) -> ScenarioDraw {
+    let base = regime.base_ensemble_tenths();
+    let ensemble_jitter = regime.ensemble_jitter_tenths();
     let mut ensemble_forecast_tenths = [0; 5];
     for (i, member) in base.iter().enumerate() {
-        ensemble_forecast_tenths[i] =
-            member + rng.gen_range(-ENSEMBLE_JITTER_TENTHS..=ENSEMBLE_JITTER_TENTHS);
+        ensemble_forecast_tenths[i] = member + rng.gen_range(-ensemble_jitter..=ensemble_jitter);
     }
-    let (stale_bid, stale_ask) = jitter_quote(rng, 0.50, 0.55);
-    let (kalshi_bid, kalshi_ask) = jitter_quote(rng, 0.90, 0.94);
+    let quote_jitter = regime.quote_jitter();
+    let (stale_base_bid, stale_base_ask) = regime.base_stale_quote();
+    let (kalshi_base_bid, kalshi_base_ask) = regime.base_kalshi_quote();
+    let (stale_bid, stale_ask) = jitter_quote(rng, quote_jitter, stale_base_bid, stale_base_ask);
+    let (kalshi_bid, kalshi_ask) =
+        jitter_quote(rng, quote_jitter, kalshi_base_bid, kalshi_base_ask);
     ScenarioDraw {
         ensemble_forecast_tenths,
         stale_bid,
@@ -95,13 +172,13 @@ fn draw_scenario(rng: &mut impl Rng) -> ScenarioDraw {
     }
 }
 
-/// One seeded draw of the demo scenario, run end to end through the real
-/// pipeline. Deterministic in `seed`: the same seed always produces the
+/// One seeded draw of `regime`, run end to end through the real pipeline.
+/// Deterministic in `(regime, seed)`: the same pair always produces the
 /// same draw and therefore the same report, which is what makes a run
 /// reproducible for debugging a specific outlier.
-pub async fn run_seeded_scenario(seed: u64) -> BacktestReport {
+pub async fn run_seeded_scenario(regime: Regime, seed: u64) -> BacktestReport {
     let mut rng = Pcg64::seed_from_u64(seed);
-    let draw = draw_scenario(&mut rng);
+    let draw = draw_scenario(regime, &mut rng);
 
     let contract = demo_contract_id();
     let venue_config = PaperConfig {
@@ -225,22 +302,23 @@ impl EdgeDistributionReport {
     }
 }
 
-/// Runs `run_seeded_scenario` for seeds `0..n_seeds` and summarizes the
-/// resulting net-P&L distribution.
+/// Runs `run_seeded_scenario` for seeds `0..n_seeds` under `regime` and
+/// summarizes the resulting net-P&L distribution.
 ///
 /// This is still a synthetic scenario with perturbed synthetic inputs,
 /// not the recorded real venue book data `docs/GOING-LIVE.md` Stage 0
 /// ultimately calls for — it answers "how sensitive is this strategy's
-/// P&L to realistic-sized noise in its inputs," which is a real and
-/// useful question, but a distribution over synthetic noise is not the
-/// same claim as a distribution over what the market actually did. Treat
-/// a positive p10 here as "not obviously broken," not as "proven
-/// profitable" — the latter needs the recorded-data replay this seeds.
-pub async fn run_edge_distribution(n_seeds: u64) -> EdgeDistributionReport {
+/// P&L to realistic-sized noise in its inputs, across a few distinct
+/// market conditions," which is a real and useful question, but a
+/// distribution over synthetic noise is not the same claim as a
+/// distribution over what the market actually did. Treat a positive p10
+/// here as "not obviously broken," not as "proven profitable" — the
+/// latter needs the recorded-data replay this seeds.
+pub async fn run_edge_distribution(regime: Regime, n_seeds: u64) -> EdgeDistributionReport {
     let mut net_pnls = Vec::with_capacity(n_seeds as usize);
     let mut excluded_seeds = Vec::new();
     for seed in 0..n_seeds {
-        let report = run_seeded_scenario(seed).await;
+        let report = run_seeded_scenario(regime, seed).await;
         if report.bus_integrity_violated {
             excluded_seeds.push(seed);
             continue;
@@ -253,17 +331,59 @@ pub async fn run_edge_distribution(n_seeds: u64) -> EdgeDistributionReport {
     }
 }
 
+/// The result of running the full edge-distribution methodology
+/// independently against all three `Regime`s.
+pub struct MultiRegimeReport {
+    pub baseline: EdgeDistributionReport,
+    pub volatility_shock: EdgeDistributionReport,
+    pub quiet_period: EdgeDistributionReport,
+}
+
+impl MultiRegimeReport {
+    /// `docs/GOING-LIVE.md` Stage 0's gate, checked rather than just
+    /// described: "out-of-sample p10 is positive after fees, across
+    /// periods that include at least one volatility shock and one quiet
+    /// week." `true` only if every regime's p10 clears zero — one good
+    /// regime and one bad one is a fail, not an average.
+    pub fn gate_passes(&self) -> bool {
+        self.baseline.percentile(10.0) > 0.0
+            && self.volatility_shock.percentile(10.0) > 0.0
+            && self.quiet_period.percentile(10.0) > 0.0
+    }
+}
+
+pub async fn run_multi_regime_distribution(n_seeds: u64) -> MultiRegimeReport {
+    MultiRegimeReport {
+        baseline: run_edge_distribution(Regime::Baseline, n_seeds).await,
+        volatility_shock: run_edge_distribution(Regime::VolatilityShock, n_seeds).await,
+        quiet_period: run_edge_distribution(Regime::QuietPeriod, n_seeds).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn the_same_seed_always_produces_the_same_report() {
-        let a = run_seeded_scenario(7).await;
-        let b = run_seeded_scenario(7).await;
+    async fn the_same_regime_and_seed_always_produces_the_same_report() {
+        let a = run_seeded_scenario(Regime::Baseline, 7).await;
+        let b = run_seeded_scenario(Regime::Baseline, 7).await;
         assert_eq!(a.net_pnl(), b.net_pnl());
         assert_eq!(a.fills, b.fills);
         assert_eq!(a.orders_rejected_by_risk, b.orders_rejected_by_risk);
+    }
+
+    #[tokio::test]
+    async fn the_same_seed_under_different_regimes_can_differ() {
+        let baseline = run_seeded_scenario(Regime::Baseline, 0).await;
+        let shock = run_seeded_scenario(Regime::VolatilityShock, 0).await;
+        let quiet = run_seeded_scenario(Regime::QuietPeriod, 0).await;
+        // Not a claim about which is bigger — just that regime actually
+        // changes the scenario rather than being a no-op label.
+        assert!(
+            baseline.net_pnl() != shock.net_pnl() || baseline.net_pnl() != quiet.net_pnl(),
+            "expected at least one regime to differ from baseline at seed 0"
+        );
     }
 
     #[tokio::test]
@@ -273,7 +393,7 @@ mod tests {
         // the same base scenario.
         let mut net_pnls = Vec::new();
         for seed in 0..20 {
-            net_pnls.push(run_seeded_scenario(seed).await.net_pnl());
+            net_pnls.push(run_seeded_scenario(Regime::Baseline, seed).await.net_pnl());
         }
         assert!(
             net_pnls.windows(2).any(|w| w[0] != w[1]),
@@ -313,5 +433,51 @@ mod tests {
         assert_eq!(report.mean(), 0.0);
         assert_eq!(report.median(), 0.0);
         assert_eq!(report.profitable_count(), 0);
+    }
+
+    #[test]
+    fn gate_passes_only_when_every_regime_clears_a_positive_p10() {
+        let positive = EdgeDistributionReport {
+            net_pnls: vec![1.0; 10],
+            excluded_seeds: vec![],
+        };
+        let negative = EdgeDistributionReport {
+            net_pnls: vec![-1.0; 10],
+            excluded_seeds: vec![],
+        };
+        let all_positive = MultiRegimeReport {
+            baseline: EdgeDistributionReport {
+                net_pnls: positive.net_pnls.clone(),
+                excluded_seeds: vec![],
+            },
+            volatility_shock: EdgeDistributionReport {
+                net_pnls: positive.net_pnls.clone(),
+                excluded_seeds: vec![],
+            },
+            quiet_period: EdgeDistributionReport {
+                net_pnls: positive.net_pnls.clone(),
+                excluded_seeds: vec![],
+            },
+        };
+        assert!(all_positive.gate_passes());
+
+        let one_negative = MultiRegimeReport {
+            baseline: EdgeDistributionReport {
+                net_pnls: positive.net_pnls.clone(),
+                excluded_seeds: vec![],
+            },
+            volatility_shock: EdgeDistributionReport {
+                net_pnls: negative.net_pnls.clone(),
+                excluded_seeds: vec![],
+            },
+            quiet_period: EdgeDistributionReport {
+                net_pnls: positive.net_pnls,
+                excluded_seeds: vec![],
+            },
+        };
+        assert!(
+            !one_negative.gate_passes(),
+            "one failing regime must fail the whole gate, not average out"
+        );
     }
 }

@@ -1,24 +1,32 @@
-//! `docs/GOING-LIVE.md` Stage 0 and Stage 4 together: this both records
-//! (Stage 0 — "record now, you cannot backfill it later") and monitors
-//! (Stage 4 — continuous real-feed ingestion at zero financial risk) the
-//! same live polling loop, since they're complementary, not competing
-//! uses of the same data.
+//! `docs/GOING-LIVE.md` Stages 0, 1, and 4 together: this records
+//! (Stage 0 — "record now, you cannot backfill it later"), checks clock
+//! discipline (Stage 1 — "NTP, monitored, with an alert on drift"), and
+//! monitors feed health (Stage 4 — continuous real-feed ingestion at zero
+//! financial risk), all off the same live polling loop, since they're
+//! complementary, not competing uses of the same connectivity.
 //!
 //! Polls Kalshi's and Polymarket's real public market-data endpoints on
 //! an interval, appends normalized book snapshots to a JSONL file (in
 //! the exact format `parallax_sim::load_jsonl` reads back for a backtest
 //! replay), feeds each successful tick into a real `ConsolidatedBook`
 //! (exercising the same validation a live deployment's book would run),
-//! and tracks per-venue consecutive-failure streaks
-//! (`parallax_cli::FeedHealthMonitor`), alerting once a streak crosses
-//! the threshold rather than on the first transient blip.
+//! tracks per-venue consecutive-failure streaks
+//! (`parallax_cli::FeedHealthMonitor`), and checks this process's clock
+//! against each venue's real HTTP `Date` header
+//! (`parallax_venues::ClockSkewMonitor`) — both alerting once a streak
+//! crosses its threshold rather than on the first transient blip or
+//! reading.
 //!
 //! What this is **not**: a live paper-trading loop in the full Stage 4
 //! sense. There is no live alpha source in this repo, and Kalshi's real
 //! `KXHIGHCHI` listing and Polymarket's real top-volume market are two
 //! different real-world events with no shared canonical contract id —
 //! see `feed_health.rs`'s module doc for why running a strategy against
-//! this feed isn't something this binary claims to do.
+//! this feed isn't something this binary claims to do. Nor is the clock
+//! check a substitute for real NTP on the host — it only proves this
+//! specific process's clock is (or isn't) sane relative to two venues it
+//! actually talks to, which is the half of "NTP, monitored" that's
+//! verifiable from inside this repo.
 //!
 //! Read-only: no order is ever placed, and no credentials are required.
 //!
@@ -27,12 +35,15 @@
 //!   PARALLAX_RECORD_OUTPUT             default: recordings/venue_ticks.jsonl
 //!   PARALLAX_RECORD_INTERVAL_SECS      default: 10
 //!   PARALLAX_RECORD_HALT_AFTER_FAILS   default: 5 (consecutive failures before a health alert)
+//!   PARALLAX_RECORD_MAX_SKEW_MS        default: 2000 (tolerance before a reading counts as skew)
+//!   PARALLAX_RECORD_SKEW_ALERT_AFTER   default: 3 (consecutive skewed readings before an alert)
 
 #![forbid(unsafe_code)]
 
 use parallax_book::ConsolidatedBook;
 use parallax_cli::FeedHealthMonitor;
-use parallax_types::VenueId;
+use parallax_types::{Timestamp, VenueId};
+use parallax_venues::ClockSkewMonitor;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -59,6 +70,31 @@ fn halt_after() -> u32 {
         .unwrap_or(5)
 }
 
+/// `docs/GOING-LIVE.md` Stage 1: how far local and venue clocks may
+/// diverge before it counts as skew rather than the `Date` header's own
+/// one-second resolution plus ordinary network jitter. 2s is generous on
+/// purpose — this alert exists to catch a clock that has actually drifted
+/// (the class of bug that shows up as signed-request auth failures), not
+/// to fire on routine latency variance.
+fn max_skew_ms() -> i64 {
+    std::env::var("PARALLAX_RECORD_MAX_SKEW_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2_000)
+}
+
+/// Consecutive out-of-tolerance readings, against the same venue, before
+/// `ClockSkewMonitor` alerts — same streak-not-blip reasoning as
+/// `halt_after` above.
+fn skew_alert_after() -> u32 {
+    std::env::var("PARALLAX_RECORD_SKEW_ALERT_AFTER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3)
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let path = output_path();
@@ -70,6 +106,7 @@ async fn main() -> std::io::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let interval = Duration::from_secs(interval_secs());
     let mut health = FeedHealthMonitor::new(halt_after());
+    let mut clock_skew = ClockSkewMonitor::new(max_skew_ms(), skew_alert_after());
     let mut book = ConsolidatedBook::new();
 
     println!(
@@ -85,7 +122,13 @@ async fn main() -> std::io::Result<()> {
     );
     println!(
         "Feeding each real tick into a live ConsolidatedBook and monitoring feed health (Stage 4) — \
-         see this binary's module doc for exactly what that does and doesn't cover.\n"
+         see this binary's module doc for exactly what that does and doesn't cover."
+    );
+    println!(
+        "Also checking this process's clock against each venue's HTTP Date header every tick \
+         (Stage 1 clock discipline) — alerting past {} consecutive readings more than {}ms off.\n",
+        skew_alert_after(),
+        max_skew_ms()
     );
 
     let mut kalshi_ok = 0u64;
@@ -156,6 +199,33 @@ async fn main() -> std::io::Result<()> {
 
                 if let Some(alert) = parallax_sim::check_feed_data_quality(&book) {
                     eprintln!("*** DATA QUALITY ALERT: {alert:?} ***");
+                }
+
+                match parallax_cli::fetch_kalshi_server_time().await {
+                    Ok(remote) => {
+                        if let Some(alert) =
+                            clock_skew.record(VenueId::Kalshi, Timestamp::now(), remote)
+                        {
+                            eprintln!(
+                                "*** CLOCK SKEW ALERT: kalshi off by {}ms for {} consecutive readings ***",
+                                alert.skew_ms, alert.consecutive
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("kalshi clock check failed: {e}"),
+                }
+                match parallax_cli::fetch_polymarket_server_time().await {
+                    Ok(remote) => {
+                        if let Some(alert) =
+                            clock_skew.record(VenueId::Polymarket, Timestamp::now(), remote)
+                        {
+                            eprintln!(
+                                "*** CLOCK SKEW ALERT: polymarket off by {}ms for {} consecutive readings ***",
+                                alert.skew_ms, alert.consecutive
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("polymarket clock check failed: {e}"),
                 }
 
                 println!(

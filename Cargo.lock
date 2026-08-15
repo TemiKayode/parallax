@@ -695,6 +695,7 @@ name = "parallax-venues"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "httpdate",
  "parallax-types",
  "reqwest",
  "serde",

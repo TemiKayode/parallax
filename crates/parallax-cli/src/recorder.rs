@@ -140,6 +140,27 @@ pub async fn fetch_polymarket_tick() -> Result<NormalizedTick, String> {
     ))
 }
 
+/// `docs/GOING-LIVE.md` Stage 1's clock-discipline check, Kalshi's side:
+/// fetches the venue's own `Date` response header via
+/// `KalshiAdapter::fetch_server_time`. Feed the result and
+/// `Timestamp::now()` into a `ClockSkewMonitor`.
+pub async fn fetch_kalshi_server_time() -> Result<Timestamp, String> {
+    let adapter = KalshiAdapter::new(
+        Arc::new(UnconfiguredKalshiSigner),
+        Arc::new(SymbolRegistry::new()),
+    );
+    adapter.fetch_server_time().await.map_err(|e| e.to_string())
+}
+
+/// Same as `fetch_kalshi_server_time`, Polymarket's side.
+pub async fn fetch_polymarket_server_time() -> Result<Timestamp, String> {
+    let adapter = PolymarketAdapter::new(
+        Arc::new(UnconfiguredPolymarketSigner),
+        Arc::new(SymbolRegistry::new()),
+    );
+    adapter.fetch_server_time().await.map_err(|e| e.to_string())
+}
+
 /// Appends one tick to a JSONL recording, in the exact envelope
 /// `parallax_sim::replay::load_jsonl` expects (`{"tick": {...}}`,
 /// snake_case, externally tagged).

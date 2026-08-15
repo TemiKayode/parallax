@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use parallax_cli::{run_demo_backtest, run_edge_distribution, sample_arb};
+use parallax_cli::{run_demo_backtest, run_multi_regime_distribution, sample_arb};
 
 fn section(title: &str) {
     println!("\n=== {title} ===");
@@ -101,39 +101,62 @@ async fn main() {
         }
     }
 
-    section("3. Edge distribution across seeds (parallax-sim, docs/GOING-LIVE.md Stage 0)");
+    section(
+        "3. Edge distribution across seeds and regimes (parallax-sim, docs/GOING-LIVE.md Stage 0)",
+    );
     {
         const N_SEEDS: u64 = 200;
-        println!("Same scenario, {N_SEEDS} seeds — each perturbs the ensemble forecast, both");
-        println!("venues' quoted prices, and queue position within realistic bounds (execution");
-        println!("latency is deliberately not perturbed here; see edge_distribution.rs for why).");
-        println!("A single run only proves the pipeline wires together; this is a p10, not a point estimate.");
-        let dist = run_edge_distribution(N_SEEDS).await;
-        println!("\n--- edge distribution report ---");
-        println!("runs:                       {}", dist.len());
-        if !dist.excluded_seeds.is_empty() {
-            println!(
-                "excluded (integrity violated): {}  {:?}",
-                dist.excluded_seeds.len(),
-                dist.excluded_seeds
-            );
-        }
         println!(
-            "profitable:                 {}/{}",
-            dist.profitable_count(),
-            dist.len()
+            "Same methodology, {N_SEEDS} seeds each, run independently against three distinct"
         );
-        println!("mean net PnL:                {:.4}", dist.mean());
-        println!("median net PnL (p50):        {:.4}", dist.median());
-        println!("p10 net PnL:                 {:.4}", dist.percentile(10.0));
-        println!("p90 net PnL:                 {:.4}", dist.percentile(90.0));
-        if dist.percentile(10.0) <= 0.0 {
+        println!("market regimes (baseline, volatility shock, quiet period) — the doc's own gate:");
+        println!(
+            "\"p10 is positive... across periods that include at least one volatility shock and"
+        );
+        println!("one quiet week.\" One good regime and one bad one is a fail, not an average.");
+        println!("(Execution latency is deliberately not perturbed here; see edge_distribution.rs for why.)");
+
+        let multi = run_multi_regime_distribution(N_SEEDS).await;
+        for (label, dist) in [
+            ("baseline", &multi.baseline),
+            ("volatility shock", &multi.volatility_shock),
+            ("quiet period", &multi.quiet_period),
+        ] {
+            println!("\n--- {label} ---");
+            println!("runs:                       {}", dist.len());
+            if !dist.excluded_seeds.is_empty() {
+                println!(
+                    "excluded (integrity violated): {}  {:?}",
+                    dist.excluded_seeds.len(),
+                    dist.excluded_seeds
+                );
+            }
             println!(
-                "\np10 is not positive — per docs/GOING-LIVE.md, this strategy's edge is not yet"
+                "profitable:                 {}/{}",
+                dist.profitable_count(),
+                dist.len()
             );
-            println!("demonstrated. This is still synthetic data with perturbed synthetic noise,");
-            println!("not the recorded real venue book data Stage 0 ultimately calls for.");
+            println!("mean net PnL:                {:.4}", dist.mean());
+            println!("median net PnL (p50):        {:.4}", dist.median());
+            println!("p10 net PnL:                 {:.4}", dist.percentile(10.0));
+            println!("p90 net PnL:                 {:.4}", dist.percentile(90.0));
         }
+
+        println!(
+            "\nStage 0 gate ({})",
+            if multi.gate_passes() {
+                "PASSES: p10 positive in every regime"
+            } else {
+                "FAILS: at least one regime's p10 is not positive"
+            }
+        );
+        println!(
+            "This is still synthetic data with perturbed synthetic noise, not the recorded real"
+        );
+        println!(
+            "venue book data Stage 0 ultimately calls for — a pass here means \"not obviously"
+        );
+        println!("broken across a few distinct conditions,\" not \"proven profitable.\"");
     }
 
     println!("\nDone. This ran entirely against synthetic data and the in-memory PaperAdapter —");

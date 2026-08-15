@@ -10,10 +10,14 @@ mod edge_distribution;
 mod feed_health;
 mod recorder;
 
-pub use edge_distribution::{run_edge_distribution, run_seeded_scenario, EdgeDistributionReport};
+pub use edge_distribution::{
+    run_edge_distribution, run_multi_regime_distribution, run_seeded_scenario,
+    EdgeDistributionReport, MultiRegimeReport, Regime,
+};
 pub use feed_health::{FeedHealthAlert, FeedHealthMonitor};
 pub use recorder::{
-    append_tick_jsonl, fetch_kalshi_tick, fetch_polymarket_tick, record_once, RecordAttempt,
+    append_tick_jsonl, fetch_kalshi_server_time, fetch_kalshi_tick, fetch_polymarket_server_time,
+    fetch_polymarket_tick, record_once, RecordAttempt,
 };
 
 use parallax_alpha::WeatherEnsembleSource;

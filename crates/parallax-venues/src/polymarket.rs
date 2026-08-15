@@ -5,7 +5,7 @@ use crate::symbol_registry::SymbolRegistry;
 use async_trait::async_trait;
 use parallax_types::{
     ClientOrderId, ExecError, OrderAck, OrderId, OrderIntent, OrderType, SettlementModel,
-    VenueCapabilities, VenueId,
+    Timestamp, VenueCapabilities, VenueId,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -134,6 +134,35 @@ impl PolymarketAdapter {
                 message: e.to_string(),
             })?;
         json_or_error(resp, VenueId::Polymarket).await
+    }
+
+    /// `docs/GOING-LIVE.md` Stage 1: "signed requests carry timestamps,
+    /// and skew shows up as authentication failures at the worst possible
+    /// moment. NTP, monitored, with an alert on drift." Rides on the same
+    /// public, unauthenticated Gamma markets endpoint as
+    /// `fetch_active_markets_raw`, but reads only the response's `Date`
+    /// header — present on every HTTP response regardless of the
+    /// endpoint's own business meaning, which makes it a free, always-
+    /// available clock reference against this venue specifically, without
+    /// needing a dedicated time endpoint that may not exist. Feed the
+    /// result into `ClockSkewMonitor` alongside `Timestamp::now()`.
+    pub async fn fetch_server_time(&self) -> Result<Timestamp, ExecError> {
+        self.rate_limiter.acquire().await;
+        let url = format!("{}/markets", self.gamma_base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("limit", 1u32)])
+            .send()
+            .await
+            .map_err(|e| ExecError::Connection {
+                venue: VenueId::Polymarket,
+                message: e.to_string(),
+            })?;
+        crate::http::response_date(&resp).ok_or_else(|| ExecError::Connection {
+            venue: VenueId::Polymarket,
+            message: "response had no parseable Date header".to_string(),
+        })
     }
 }
 

@@ -3,7 +3,7 @@
 //! decoder that turns an HTTP status into a typed `ExecError` instead of
 //! calling `.json()` blind.
 
-use parallax_types::{ExecError, VenueId};
+use parallax_types::{ExecError, Timestamp, VenueId};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -190,6 +190,30 @@ pub async fn json_or_error<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Parses the HTTP `Date` response header (RFC 7231, e.g. `Sun, 06 Nov
+/// 1994 08:49:37 GMT`) into a `Timestamp`. Split out as a pure function
+/// for the same reason `classify_status` is — testable against a literal
+/// string, not a constructed `reqwest::Response`
+/// (`docs/GOING-LIVE.md` Stage 1, clock discipline).
+pub fn parse_http_date(value: &str) -> Option<Timestamp> {
+    let system_time = httpdate::parse_http_date(value).ok()?;
+    let nanos = system_time
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(Timestamp::from_nanos(nanos.min(i64::MAX as u128) as i64))
+}
+
+/// Every HTTP response carries a `Date` header, independent of the
+/// endpoint's own business meaning — a free, always-available clock
+/// reference riding along on any live venue call. `None` if the header is
+/// missing or unparseable, which is not a reason to fail the call this is
+/// riding on top of.
+pub fn response_date(resp: &reqwest::Response) -> Option<Timestamp> {
+    let value = resp.headers().get(reqwest::header::DATE)?.to_str().ok()?;
+    parse_http_date(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +338,18 @@ mod tests {
         let start = Instant::now();
         limiter.acquire_for_cancel().await;
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_valid_rfc_7231_date_header_parses_to_the_correct_timestamp() {
+        // 2024-01-01T00:00:00Z, a round number to hand-check against.
+        let ts = parse_http_date("Mon, 01 Jan 2024 00:00:00 GMT").unwrap();
+        assert_eq!(ts.as_nanos(), 1_704_067_200_000_000_000);
+    }
+
+    #[test]
+    fn a_malformed_date_header_parses_to_none_rather_than_panicking() {
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date(""), None);
     }
 }

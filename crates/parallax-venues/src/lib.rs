@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod clock;
 mod deadman;
 mod execution;
 mod http;
@@ -22,9 +23,10 @@ mod rounding;
 mod symbol_registry;
 
 pub use adapter::VenueAdapter;
+pub use clock::{ClockSkewAlert, ClockSkewMonitor};
 pub use deadman::{run_heartbeat_loop, DeadmanSwitch};
 pub use execution::{submit_idempotent, SubmitOutcome};
-pub use http::{client as http_client, json_or_error, RateLimiter};
+pub use http::{client as http_client, json_or_error, parse_http_date, response_date, RateLimiter};
 pub use journal::{
     export_fill_ledger, recover_unresolved, write_ledger_csv, JournalEntry, LedgerRow, OrderJournal,
 };

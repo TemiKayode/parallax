@@ -137,6 +137,35 @@ impl KalshiAdapter {
             })?;
         json_or_error(resp, VenueId::Kalshi).await
     }
+
+    /// `docs/GOING-LIVE.md` Stage 1: "signed requests carry timestamps,
+    /// and skew shows up as authentication failures at the worst possible
+    /// moment. NTP, monitored, with an alert on drift." Rides on the same
+    /// public, unauthenticated markets endpoint as
+    /// `fetch_open_markets_for_series_raw`, but reads only the response's
+    /// `Date` header — present on every HTTP response regardless of the
+    /// endpoint's own business meaning, which makes it a free, always-
+    /// available clock reference against this venue specifically, without
+    /// needing a dedicated time endpoint that may not exist. Feed the
+    /// result into `ClockSkewMonitor` alongside `Timestamp::now()`.
+    pub async fn fetch_server_time(&self) -> Result<Timestamp, ExecError> {
+        self.rate_limiter.acquire().await;
+        let url = format!("{}/markets", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("limit", 1u32)])
+            .send()
+            .await
+            .map_err(|e| ExecError::Connection {
+                venue: VenueId::Kalshi,
+                message: e.to_string(),
+            })?;
+        crate::http::response_date(&resp).ok_or_else(|| ExecError::Connection {
+            venue: VenueId::Kalshi,
+            message: "response had no parseable Date header".to_string(),
+        })
+    }
 }
 
 /// Kalshi's orderbook shows resting BUY depth on both the YES and NO
