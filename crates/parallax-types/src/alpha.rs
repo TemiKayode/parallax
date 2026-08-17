@@ -21,6 +21,14 @@ pub enum AlphaEventKind {
     /// imbalance, correlated-asset residual) key off this one kind, the
     /// same way every weather source keys off `Weather`.
     ReferenceAsset,
+    /// A live state snapshot of a sporting contest whose outcome a
+    /// contract resolves on — score, who is serving/possessing, whether
+    /// the current point is structurally decisive. Added for the tennis
+    /// match-state source: any future sport source (a football match
+    /// clock, a cricket innings state) keys off this same kind and
+    /// discriminates on the payload's own `sport` field, the same way
+    /// every crypto source keys off `ReferenceAsset`.
+    SportsMatchState,
 }
 
 /// The common envelope every external fact arrives in, regardless of

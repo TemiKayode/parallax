@@ -28,6 +28,57 @@ pub struct NewsConfig {
     pub sensitivity: f64,
 }
 
+/// Constants for the tennis match-state source. Deliberately NOT a field
+/// of `AlphaConfig`: that struct mirrors, byte for byte, the JSON the
+/// offline Python exporter writes, and the tennis constants are not
+/// fitted by that pipeline — they are operator-supplied deployment
+/// config, the same channel that carries the vendor API key (which, like
+/// every credential, lives in deployment config or the environment and
+/// never in this repository).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TennisConfig {
+    /// P(server wins any given point), the single parameter of the
+    /// symmetric point→game→set→match chain. The default is a
+    /// tour-average-shaped prior, not a fitted constant — retune it from
+    /// measured data before trusting the source with real quotes.
+    pub serve_point_win: f64,
+    /// Floor on the emitted std_dev — same defense-in-depth role as
+    /// `WeatherConfig::min_std_dev`.
+    pub min_std_dev: f64,
+}
+
+impl Default for TennisConfig {
+    fn default() -> Self {
+        TennisConfig {
+            serve_point_win: 0.62,
+            min_std_dev: 0.01,
+        }
+    }
+}
+
+impl TennisConfig {
+    /// Same contract as `AlphaConfig::validate`: reject constants that
+    /// would silently *disable* the model rather than retune it. A
+    /// `serve_point_win` at or beyond either edge makes every game a
+    /// foregone conclusion, and a non-positive `min_std_dev` reads
+    /// downstream as "more confident," not "broken."
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(self.serve_point_win > 0.0 && self.serve_point_win < 1.0) {
+            return Err(ConfigError::Invalid(format!(
+                "tennis.serve_point_win must lie strictly inside (0, 1), got {}",
+                self.serve_point_win
+            )));
+        }
+        if !(self.min_std_dev > 0.0 && self.min_std_dev.is_finite()) {
+            return Err(ConfigError::Invalid(format!(
+                "tennis.min_std_dev must be positive and finite, got {}",
+                self.min_std_dev
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AlphaConfig {
     pub weather: WeatherConfig,
@@ -149,5 +200,40 @@ mod tests {
     #[test]
     fn malformed_json_is_a_clear_error_not_a_panic() {
         assert!(AlphaConfig::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn the_exporters_json_still_parses_without_a_tennis_field() {
+        // TennisConfig is deliberately NOT part of AlphaConfig — the
+        // exporter's exact shape must keep parsing unchanged.
+        assert!(AlphaConfig::from_json(exported_json()).is_ok());
+    }
+
+    #[test]
+    fn tennis_defaults_validate() {
+        assert!(TennisConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn tennis_rejects_a_serve_point_win_at_either_edge() {
+        for bad in [0.0, 1.0, -0.1, 1.1, f64::NAN] {
+            let config = TennisConfig {
+                serve_point_win: bad,
+                ..TennisConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "serve_point_win {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tennis_rejects_a_zero_min_std_dev_that_would_silently_overclaim_confidence() {
+        let config = TennisConfig {
+            min_std_dev: 0.0,
+            ..TennisConfig::default()
+        };
+        assert!(config.validate().is_err());
     }
 }
